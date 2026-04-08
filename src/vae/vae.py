@@ -10,11 +10,10 @@ import pyro.distributions as dist
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import visdom
 from pyro.infer import SVI, JitTrace_ELBO, Trace_ELBO
 from pyro.optim import Adam
 
-from src.vae.utils.vae_plots import mnist_test_tsne, plot_llk, plot_vae_samples
+from src.vae.utils.vae_plots import plot_llk
 
 pyro.set_rng_seed(42)
 torch.manual_seed(42)
@@ -69,13 +68,13 @@ class VAE(nn.Module):
         self.prior_t_df = prior_t_df
 
     # define the model p(x|z)p(z)
-    def model(self, x, anneling_factor=1):
+    def model(self, x, annealing_factor=1):
         pyro.module("decoder", self.decoder)
         with pyro.plate("data", x.shape[0]):
             z_loc = torch.zeros(x.shape[0], self.z_dim, dtype=x.dtype, device=x.device)
             z_scale = torch.ones(x.shape[0], self.z_dim, dtype=x.dtype, device=x.device)
 
-            with pyro.poutine.scale(scale=anneling_factor):
+            with pyro.poutine.scale(scale=annealing_factor):
                 if np.isinf(self.prior_t_df):
                     z = pyro.sample("latent", dist.Normal(z_loc, z_scale).to_event(1))
                 else:
@@ -98,14 +97,14 @@ class VAE(nn.Module):
             return x_loc
 
     # define the guide (i.e. variational distribution) q(z|x)
-    def guide(self, x, anneling_factor=1):
+    def guide(self, x, annealing_factor=1):
         # register PyTorch module `encoder` with Pyro
         pyro.module("encoder", self.encoder)
         with pyro.plate("data", x.shape[0]):
             # use the encoder to get the parameters used to define q(z|x)
             z_loc, z_scale = self.encoder.forward(x)
             # sample the latent code z
-            with pyro.poutine.scale(scale=anneling_factor):
+            with pyro.poutine.scale(scale=annealing_factor):
                 if np.isinf(self.prior_t_df):
                     pyro.sample("latent", dist.Normal(z_loc, z_scale).to_event(1))
                 else:
@@ -135,14 +134,12 @@ def train(
     hidden_dim: int = 50,
     z_dim=2,
     beta=1,
-    anneling_start=1,
+    annealing_start=1,
     num_epochs=30,
     test_frequency=5,
     learning_rate=1.0e-3,
     cuda=False,
     jit=False,
-    visdom_flag=False,
-    tsne_iter=100,
     prior_t_df=np.inf,
 ):
     # clear param store
@@ -167,28 +164,19 @@ def train(
     elbo = JitTrace_ELBO() if jit else Trace_ELBO()
     svi = SVI(vae.model, vae.guide, optimizer, loss=elbo)
 
-    # setup visdom for visualization
-    if visdom_flag:
-        vis = visdom.Visdom()
-
     train_elbo = {}
     test_elbo = {}
     # training loop
     for epoch in range(num_epochs):
-        #
         progress = min((epoch + 1) / num_epochs, 1.0)
-        anneling_factor = (1 - progress) * anneling_start + progress * beta
+        annealing_factor = (1 - progress) * annealing_start + progress * beta
 
         # initialize loss accumulator
         epoch_loss = 0.0
-        # do a training epoch over each mini-batch x returned
-        # by the data loader
         for (x,) in train_loader:
-            # if on GPU put mini-batch into CUDA memory
             if cuda:
                 x = x.cuda()
-            # do ELBO gradient and accumulate loss
-            epoch_loss += svi.step(x, anneling_factor)
+            epoch_loss += svi.step(x, annealing_factor)
 
         # report training diagnostics
         normalizer_train = len(train_loader.dataset)
@@ -200,33 +188,11 @@ def train(
         )
 
         if epoch % test_frequency == 0:
-            # initialize loss accumulator
             test_loss = 0.0
-            # compute the loss over the entire test set
-            for i, (x,) in enumerate(test_loader):
-                # if on GPU put mini-batch into CUDA memory
+            for (x,) in test_loader:
                 if cuda:
                     x = x.cuda()
-                # compute ELBO estimate and accumulate loss
-                test_loss += svi.evaluate_loss(x, anneling_factor)
-
-                # pick three random test images from the first mini-batch and
-                # visualize how well we're reconstructing them
-                if i == 0:
-                    if visdom_flag:
-                        plot_vae_samples(vae, vis)
-                        reco_indices = np.random.randint(0, x.shape[0], 3)
-                        for index in reco_indices:
-                            test_img = x[index, :]
-                            reco_img = vae.reconstruct_img(test_img)
-                            vis.image(
-                                test_img.reshape(28, 28).detach().cpu().numpy(),
-                                opts={"caption": "test image"},
-                            )
-                            vis.image(
-                                reco_img.reshape(28, 28).detach().cpu().numpy(),
-                                opts={"caption": "reconstructed image"},
-                            )
+                test_loss += svi.evaluate_loss(x, annealing_factor)
 
             # report test diagnostics
             normalizer_test = len(test_loader.dataset)
@@ -236,9 +202,6 @@ def train(
                 "[epoch %03d]  average test loss: %.4f" % (epoch, total_epoch_loss_test)
             )
             plot_llk(train_elbo, test_elbo)
-
-        if epoch == tsne_iter:
-            mnist_test_tsne(vae=vae, test_loader=test_loader)
 
     return vae
 

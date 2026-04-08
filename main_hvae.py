@@ -19,12 +19,10 @@ if __name__ == "__main__":
         value_types=["IVS"],
     )
 
-    c_dim = cols["c1_dim"] + cols["c2_dim"]
+    c_dim = cols["c2_dim"]
 
     print(f"Grid size : {cols['x1_dim']}")
-    print(
-        f"c1_dim    : {cols['c1_dim']}  c2_dim: {cols['c2_dim']}  total c_dim: {c_dim}"
-    )
+    print(f"c2_dim    : {cols['c2_dim']}  (used as c_dim for HVAE)")
     print(f"Train     : {len(loaders['train'].dataset)}")
     print(f"Test      : {len(loaders['test'].dataset)}")
 
@@ -50,13 +48,11 @@ if __name__ == "__main__":
     # quick reconstruction check on test set
     vae.eval()
     x1t = torch.tensor(data["X1"], dtype=torch.float32)
-    c1t = torch.tensor(data["C1"], dtype=torch.float32)
     x2t = torch.tensor(data["X2"], dtype=torch.float32)
     c2t = torch.tensor(data["C2"], dtype=torch.float32)
-    ct = torch.cat([c1t, c2t], dim=-1)
 
     with torch.no_grad():
-        x1_rec, x2_rec = vae.reconstruct_map(x1t, x2t, ct)
+        x1_rec, x2_rec = vae.reconstruct_map(x1t, x2t, c2t)
 
     mse1 = ((x1t - x1_rec) ** 2).mean().item()
     mse2 = ((x2t - x2_rec) ** 2).mean().item()

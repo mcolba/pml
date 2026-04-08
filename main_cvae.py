@@ -51,7 +51,7 @@ if __name__ == "__main__":
         x_dim=len(tenors),
         c_dim=5,
         beta=1.5,
-        anneling_start=0,
+        annealing_start=0,
         z_dim=2,
         hidden_dim=50,
         num_epochs=num_epochs,

@@ -10,12 +10,11 @@ import pyro.distributions as dist
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import visdom
 from pyro.infer import SVI, Trace_ELBO
 from pyro.optim import Adam
 
 from src.dHSIC import make_elbo_hsic
-from src.vae.utils.vae_plots import plot_llk, plot_vae_samples
+from src.vae.utils.vae_plots import plot_llk
 
 pyro.set_rng_seed(42)
 torch.manual_seed(42)
@@ -124,13 +123,13 @@ class CVAE(nn.Module):
         self.use_cuda = use_cuda
         self.z_dim = z_dim
 
-    def model(self, x, c, anneling_factor=1):
+    def model(self, x, c, annealing_factor=1):
         pyro.module("decoder", self.decoder)
         with pyro.plate("data", x.shape[0]):
             z_loc = torch.zeros(x.shape[0], self.z_dim, dtype=x.dtype, device=x.device)
             z_scale = torch.ones(x.shape[0], self.z_dim, dtype=x.dtype, device=x.device)
 
-            with pyro.poutine.scale(scale=anneling_factor):
+            with pyro.poutine.scale(scale=annealing_factor):
                 z = pyro.sample("latent", dist.Normal(z_loc, z_scale).to_event(1))
 
             x_loc, log_x_scale = self.decoder.forward(z, c)
@@ -143,11 +142,11 @@ class CVAE(nn.Module):
             )
             return x_loc
 
-    def guide(self, x, c, anneling_factor=1):
+    def guide(self, x, c, annealing_factor=1):
         pyro.module("encoder", self.encoder)
         with pyro.plate("data", x.shape[0]):
             z_loc, z_scale = self.encoder.forward(x, c)
-            with pyro.poutine.scale(scale=anneling_factor):
+            with pyro.poutine.scale(scale=annealing_factor):
                 pyro.sample("latent", dist.Normal(z_loc, z_scale).to_event(1))
 
     def reconstruct(self, x, c):
@@ -181,14 +180,14 @@ class CVAEVolClustering(nn.Module):
         self.use_cuda = use_cuda
         self.z_dim = z_dim
 
-    def model(self, x, c, anneling_factor=1):
+    def model(self, x, c, annealing_factor=1):
         pyro.module("decoder", self.decoder)
 
         with pyro.plate("data", x.shape[0]):
             z_loc = torch.zeros(x.shape[0], self.z_dim, dtype=x.dtype, device=x.device)
             z_scale = torch.ones(x.shape[0], self.z_dim, dtype=x.dtype, device=x.device)
 
-            with pyro.poutine.scale(scale=anneling_factor):
+            with pyro.poutine.scale(scale=annealing_factor):
                 z = pyro.sample("latent", dist.Normal(z_loc, z_scale).to_event(1))
 
             x_loc, log_x_scale = self.decoder.forward(z, c)
@@ -201,11 +200,11 @@ class CVAEVolClustering(nn.Module):
             )
             return x_loc
 
-    def guide(self, x, c, anneling_factor=1):
+    def guide(self, x, c, annealing_factor=1):
         pyro.module("encoder", self.encoder)
         with pyro.plate("data", x.shape[0]):
             z_loc, z_scale = self.encoder.forward(x, c)
-            with pyro.poutine.scale(scale=anneling_factor):
+            with pyro.poutine.scale(scale=annealing_factor):
                 pyro.sample("latent", dist.Normal(z_loc, z_scale).to_event(1))
 
     def reconstruct(self, x, c):
@@ -224,10 +223,6 @@ class CVAEVolClustering(nn.Module):
         x_loc, _ = self.decoder(z_loc, c2)
         return x_loc
 
-    def get_epsilons(self, x, c):
-        z_loc, log_z_scale = self.encoder(torch.tensor(x), torch.tensor(c))
-        epsilon = z_loc / torch.exp(log_z_scale)
-        return epsilon.cpu().detach().numpy()
 
 
 class CVAEEteroschPrior(nn.Module):
@@ -246,7 +241,7 @@ class CVAEEteroschPrior(nn.Module):
         self.use_cuda = use_cuda
         self.z_dim = z_dim
 
-    def model(self, x, c, anneling_factor=1):
+    def model(self, x, c, annealing_factor=1):
         pyro.module("decoder", self.decoder)
         pyro.module("prior_scale", self.prior_scale)
 
@@ -254,7 +249,7 @@ class CVAEEteroschPrior(nn.Module):
             z_loc = torch.zeros(x.shape[0], self.z_dim, dtype=x.dtype, device=x.device)
             z_scale = self.prior_scale(c)
 
-            with pyro.poutine.scale(scale=anneling_factor):
+            with pyro.poutine.scale(scale=annealing_factor):
                 z = pyro.sample("latent", dist.Normal(z_loc, z_scale).to_event(1))
 
             x_loc, log_x_scale = self.decoder.forward(z, c)
@@ -267,11 +262,11 @@ class CVAEEteroschPrior(nn.Module):
             )
             return x_loc
 
-    def guide(self, x, c, anneling_factor=1):
+    def guide(self, x, c, annealing_factor=1):
         pyro.module("encoder", self.encoder)
         with pyro.plate("data", x.shape[0]):
             z_loc, z_scale = self.encoder.forward(x, c)
-            with pyro.poutine.scale(scale=anneling_factor):
+            with pyro.poutine.scale(scale=annealing_factor):
                 pyro.sample("latent", dist.Normal(z_loc, z_scale).to_event(1))
 
     def reconstruct(self, x, c):
@@ -290,11 +285,6 @@ class CVAEEteroschPrior(nn.Module):
         x_loc, _ = self.decoder(z_loc, c2)
         return x_loc
 
-    def get_epsilons(self, x, c):
-        z_loc, log_z_scale = self.encoder(torch.tensor(x), torch.tensor(c))
-        epsilon = z_loc / torch.exp(log_z_scale)
-        return epsilon.cpu().detach().numpy()
-
 
 def train(
     data_loaders: Iterable,
@@ -303,16 +293,13 @@ def train(
     hidden_dim: int = 50,
     z_dim=2,
     beta=1,
-    anneling_start=1,
+    annealing_start=1,
     num_epochs=30,
     heteroscedastic=False,
     dhsic_lambda=0.0,
     test_frequency=5,
     learning_rate=1.0e-3,
     cuda=False,
-    jit=False,
-    visdom_flag=False,
-    tsne_iter=100,
 ):
     # clear param store
     pyro.clear_param_store()
@@ -337,36 +324,26 @@ def train(
     # setup the inference algorithm
     if dhsic_lambda > 0:
         elbo = make_elbo_hsic(dhsic_lambda)
-    elif jit:
-        raise NotImplementedError
     else:
         elbo = Trace_ELBO()
 
     svi = SVI(vae.model, vae.guide, optimizer, loss=elbo)
-
-    # setup visdom for visualization
-    if visdom_flag:
-        vis = visdom.Visdom()
 
     train_elbo = {}
     test_elbo = {}
     # training loop
     for epoch in range(num_epochs):
         progress = min((epoch + 1) / num_epochs, 1.0)
-        anneling_factor = (1 - progress) * anneling_start + progress * beta
+        annealing_factor = (1 - progress) * annealing_start + progress * beta
 
         # initialize loss accumulator
         epoch_loss = 0.0
-        # do a training epoch over each mini-batch x returned
-        # by the data loader
         for batch in train_loader:
             x, c = batch
-            # if on GPU put mini-batch into CUDA memory
             if cuda:
                 x = x.cuda()
                 c = c.cuda()
-            # do ELBO gradient and accumulate loss
-            epoch_loss += svi.step(x, c, anneling_factor)
+            epoch_loss += svi.step(x, c, annealing_factor)
 
         # report training diagnostics
         normalizer_train = len(train_loader.dataset)
@@ -378,36 +355,13 @@ def train(
         )
 
         if epoch % test_frequency == 0:
-            # initialize loss accumulator
             test_loss = 0.0
-            # compute the loss over the entire test set
-            for i, batch in enumerate(test_loader):
+            for batch in test_loader:
                 x, c = batch
-
-                # if on GPU put mini-batch into CUDA memory
                 if cuda:
                     x = x.cuda()
                     c = c.cuda()
-                # compute ELBO estimate and accumulate loss
-                test_loss += svi.evaluate_loss(x, c, anneling_factor)
-
-                # pick three random test images from the first mini-batch and
-                # visualize how well we're reconstructing them
-                if i == 0:
-                    if visdom_flag:
-                        plot_vae_samples(vae, vis)
-                        reco_indices = np.random.randint(0, x.shape[0], 3)
-                        for index in reco_indices:
-                            test_img = x[index, :]
-                            reco_img = vae.reconstruct_img(test_img)
-                            vis.image(
-                                test_img.reshape(28, 28).detach().cpu().numpy(),
-                                opts={"caption": "test image"},
-                            )
-                            vis.image(
-                                reco_img.reshape(28, 28).detach().cpu().numpy(),
-                                opts={"caption": "reconstructed image"},
-                            )
+                test_loss += svi.evaluate_loss(x, c, annealing_factor)
 
             # report test diagnostics
             normalizer_test = len(test_loader.dataset)
@@ -417,9 +371,6 @@ def train(
                 "[epoch %03d]  average test loss: %.4f" % (epoch, total_epoch_loss_test)
             )
             plot_llk(train_elbo, test_elbo)
-
-        # if epoch == tsne_iter:
-        #     mnist_test_tsne(vae=vae, test_loader=test_loader)
 
     return vae
 

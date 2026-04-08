@@ -10,7 +10,8 @@ from torch.utils.data import DataLoader, Dataset, TensorDataset
 class ConditionalDataset(Dataset):
     def __init__(self, x, c):
         self.tds = TensorDataset(
-            torch.tensor(x, dtype=torch.float32), torch.tensor(c, dtype=torch.float32)
+            torch.as_tensor(x, dtype=torch.float32),
+            torch.as_tensor(c, dtype=torch.float32),
         )
 
     def __len__(self):
@@ -32,10 +33,10 @@ class HierarchicalDataset(Dataset):
     """
 
     def __init__(self, x1, c1, x2, c2):
-        self.x1 = torch.tensor(x1, dtype=torch.float32)
-        self.c1 = torch.tensor(c1, dtype=torch.float32)
-        self.x2 = torch.tensor(x2, dtype=torch.float32)
-        self.c2 = torch.tensor(c2, dtype=torch.float32)
+        self.x1 = torch.as_tensor(x1, dtype=torch.float32)
+        self.c1 = torch.as_tensor(c1, dtype=torch.float32)
+        self.x2 = torch.as_tensor(x2, dtype=torch.float32)
+        self.c2 = torch.as_tensor(c2, dtype=torch.float32)
 
     def __len__(self):
         return len(self.x1)
@@ -328,7 +329,6 @@ def load_iv_data_hvae(
 
             c2_all.append(np.hstack([level, sec, evt]))
 
-        # order: x1, c1, x2, c2
         return (
             np.vstack(x1_all),
             np.vstack(c1_all),

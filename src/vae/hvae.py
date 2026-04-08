@@ -189,7 +189,7 @@ class HierarchicalVAE(nn.Module):
 
     # ---- Pyro model / guide ------------------------------------------------
 
-    def model(self, x1, x2, c, annealing_factor=1.0):
+    def model(self, x1, x2, c2, annealing_factor=1.0):
         pyro.module("decoder1", self.decoder1)
         pyro.module("decoder2", self.decoder2)
         pyro.module("prior_z2", self.prior_z2)
@@ -218,12 +218,12 @@ class HierarchicalVAE(nn.Module):
             )
 
             # --- Stage-2 conditional prior & likelihood ---
-            z2_loc, z2_scale = self.prior_z2(z1, c)
+            z2_loc, z2_scale = self.prior_z2(z1, c2)
 
             with pyro.poutine.scale(scale=annealing_factor):
                 z2 = pyro.sample("z2", dist.Normal(z2_loc, z2_scale).to_event(1))
 
-            x2_loc, log_x2_scale = self.decoder2(z2, z1, c)
+            x2_loc, log_x2_scale = self.decoder2(z2, z1, c2)
             x2_scale = torch.exp(log_x2_scale)
 
             pyro.sample(
@@ -234,7 +234,7 @@ class HierarchicalVAE(nn.Module):
 
         return x1_loc, x2_loc
 
-    def guide(self, x1, x2, c, annealing_factor=1.0):
+    def guide(self, x1, x2, c2, annealing_factor=1.0):
         pyro.module("encoder1", self.encoder1)
         pyro.module("encoder2", self.encoder2)
 
@@ -245,80 +245,92 @@ class HierarchicalVAE(nn.Module):
                 z1 = pyro.sample("z1", dist.Normal(z1_loc, z1_scale).to_event(1))
 
             # --- Stage-2 posterior (conditioned on z1) ---
-            z2_loc, z2_scale = self.encoder2(x2, z1, c)
+            z2_loc, z2_scale = self.encoder2(x2, z1, c2)
             with pyro.poutine.scale(scale=annealing_factor):
                 pyro.sample("z2", dist.Normal(z2_loc, z2_scale).to_event(1))
 
     # ---- Inference helpers --------------------------------------------------
 
-    def reconstruct(self, x1, x2, c):
+    def reconstruct(self, x1, x2, c2):
         """Stochastic reconstruction of both x1 and x2."""
         z1_loc, z1_scale = self.encoder1(x1)
         z1 = dist.Normal(z1_loc, z1_scale).sample()
         x1_loc, _ = self.decoder1(z1)
 
-        z2_loc, z2_scale = self.encoder2(x2, z1, c)
+        z2_loc, z2_scale = self.encoder2(x2, z1, c2)
         z2 = dist.Normal(z2_loc, z2_scale).sample()
-        x2_loc, _ = self.decoder2(z2, z1, c)
+        x2_loc, _ = self.decoder2(z2, z1, c2)
         return x1_loc, x2_loc
 
-    def reconstruct_map(self, x1, x2, c):
+    def reconstruct_map(self, x1, x2, c2):
         """MAP (mean) reconstruction – no sampling noise."""
         z1_loc, _ = self.encoder1(x1)
         x1_loc, _ = self.decoder1(z1_loc)
 
-        z2_loc, _ = self.encoder2(x2, z1_loc, c)
-        x2_loc, _ = self.decoder2(z2_loc, z1_loc, c)
+        z2_loc, _ = self.encoder2(x2, z1_loc, c2)
+        x2_loc, _ = self.decoder2(z2_loc, z1_loc, c2)
         return x1_loc, x2_loc
 
-    def counterfactual_prediction(self, x1, c_new):
+    def counterfactual_prediction(self, x1, c2_new):
         """
         Predict x2 under a new condition without observing x2.
 
         Infers z1 from x1, draws z2 from the conditional prior
-        p(z2 | z1, c_new), and decodes x2.  Uses the prior *mean*
+        p(z2 | z1, c2_new), and decodes x2.  Uses the prior *mean*
         for z2 (MAP estimate), so the output is deterministic.
         """
         z1_loc, _ = self.encoder1(x1)
-        z2_loc, _ = self.prior_z2(z1_loc, c_new)
-        x2_loc, _ = self.decoder2(z2_loc, z1_loc, c_new)
+        z2_loc, _ = self.prior_z2(z1_loc, c2_new)
+        x2_loc, _ = self.decoder2(z2_loc, z1_loc, c2_new)
         x1_loc, _ = self.decoder1(z1_loc)
         return x1_loc, x2_loc
 
-    def predict_x2(self, x1, c):
+    def predict_x2(self, x1, c2):
         """
-        MAP prediction of x2 from x1 and condition c (no x2 observed).
+        MAP prediction of x2 from x1 and condition c2 (no x2 observed).
 
         Uses the posterior mean for z1 and the conditional prior mean
         for z2, so the output is fully deterministic.
         """
         z1_loc, _ = self.encoder1(x1)
-        z2_loc, _ = self.prior_z2(z1_loc, c)
-        x2_loc, _ = self.decoder2(z2_loc, z1_loc, c)
+        z2_loc, _ = self.prior_z2(z1_loc, c2)
+        x2_loc, _ = self.decoder2(z2_loc, z1_loc, c2)
         return x2_loc
 
-    def encode(self, x1, x2, c):
+    def encode(self, x1, x2, c2):
         """Return posterior means for both latent layers."""
         z1_loc, _ = self.encoder1(x1)
-        z2_loc, _ = self.encoder2(x2, z1_loc, c)
+        z2_loc, _ = self.encoder2(x2, z1_loc, c2)
         return z1_loc, z2_loc
 
-    def sample_x2(self, x1, c, n_samples=1):
+    def sample_x2(self, x1, c2, n_samples=1):
         """
-        Generate x2 samples given observed x1 and condition c.
+        Generate x2 samples given observed x1 and condition c2.
 
-        z1 is inferred from x1 (posterior mean); z2 is *sampled* from
-        the learned conditional prior p(z2 | z1, c).
+        Supports batched inputs: x1 of shape (B, x1_dim) and c2 of
+        shape (B, c2_dim).  Returns shape (B, n_samples, x2_dim).
+
+        For a single sample (no batch dim), returns (n_samples, x2_dim).
         """
-        z1_loc, _ = self.encoder1(x1)
-        z1 = z1_loc if z1_loc.dim() == 2 else z1_loc.unsqueeze(0)
-        z1 = z1.expand(n_samples, -1)
-        c = c if c.dim() == 2 else c.unsqueeze(0)
-        c = c.expand(n_samples, -1)
+        squeeze = x1.dim() == 1
+        if squeeze:
+            x1 = x1.unsqueeze(0)
+            c2 = c2.unsqueeze(0)
 
-        z2_loc, z2_scale = self.prior_z2(z1, c)
+        z1_loc, _ = self.encoder1(x1)  # (B, z1_dim)
+        B = z1_loc.shape[0]
+
+        # Repeat each sample n_samples times: (B*n_samples, dim)
+        z1_exp = z1_loc.unsqueeze(1).expand(B, n_samples, -1).reshape(B * n_samples, -1)
+        c2_exp = c2.unsqueeze(1).expand(B, n_samples, -1).reshape(B * n_samples, -1)
+
+        z2_loc, z2_scale = self.prior_z2(z1_exp, c2_exp)
         z2 = dist.Normal(z2_loc, z2_scale).sample()
-        x2_loc, _ = self.decoder2(z2, z1, c)
+        x2_loc, _ = self.decoder2(z2, z1_exp, c2_exp)
+
+        x2_loc = x2_loc.reshape(B, n_samples, -1)
+        if squeeze:
+            x2_loc = x2_loc.squeeze(0)  # (n_samples, x2_dim)
         return x2_loc
 
 
@@ -369,11 +381,10 @@ def train(
 
         epoch_loss = 0.0
         for batch in train_loader:
-            x1, c1, x2, c2 = batch
-            c = torch.cat([c1, c2], dim=-1)
+            x1, _c1, x2, c2 = batch
             if cuda:
-                x1, x2, c = x1.cuda(), x2.cuda(), c.cuda()
-            epoch_loss += svi.step(x1, x2, c, annealing_factor)
+                x1, x2, c2 = x1.cuda(), x2.cuda(), c2.cuda()
+            epoch_loss += svi.step(x1, x2, c2, annealing_factor)
 
         normalizer_train = len(train_loader.dataset)
         total_epoch_loss_train = epoch_loss / normalizer_train
@@ -386,11 +397,10 @@ def train(
         if epoch % test_frequency == 0:
             test_loss = 0.0
             for batch in test_loader:
-                x1, c1, x2, c2 = batch
-                c = torch.cat([c1, c2], dim=-1)
+                x1, _c1, x2, c2 = batch
                 if cuda:
-                    x1, x2, c = x1.cuda(), x2.cuda(), c.cuda()
-                test_loss += svi.evaluate_loss(x1, x2, c, annealing_factor)
+                    x1, x2, c2 = x1.cuda(), x2.cuda(), c2.cuda()
+                test_loss += svi.evaluate_loss(x1, x2, c2, annealing_factor)
 
             normalizer_test = len(test_loader.dataset)
             total_epoch_loss_test = test_loss / normalizer_test
