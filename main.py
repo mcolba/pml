@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from src.data_loaders import load_yeld_data_vae
+from src.data_loaders import load_yield_data_vae
 from src.plot_helper import (
     plot_latent_space,
     show_latent_manifold_6x6,
@@ -21,7 +21,7 @@ if __name__ == "__main__":
     path = Path(r"C:\dev\git\pml\data\synthetic_yield_curves.csv")
     output_folder = Path(r"C:\dev\git\pml\results\vae")
 
-    loaders, tenors, data = load_yeld_data_vae(
+    loaders, tenors, data = load_yield_data_vae(
         file_path=path,
         batch_size=256,
         normalise=True,
@@ -37,6 +37,7 @@ if __name__ == "__main__":
     # train VAE
     vae = train(
         data_loaders=(train_loader, test_loader),
+        x_dim=len(tenors),
         beta=1.5,
         anneling_start=0,
         z_dim=2,

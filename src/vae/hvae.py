@@ -311,8 +311,10 @@ class HierarchicalVAE(nn.Module):
         the learned conditional prior p(z2 | z1, c).
         """
         z1_loc, _ = self.encoder1(x1)
-        z1 = z1_loc.expand(n_samples, -1) if z1_loc.dim() == 1 else z1_loc
-        c = c.expand_as(z1[..., : self.c_dim]) if c.dim() < z1.dim() else c
+        z1 = z1_loc if z1_loc.dim() == 2 else z1_loc.unsqueeze(0)
+        z1 = z1.expand(n_samples, -1)
+        c = c if c.dim() == 2 else c.unsqueeze(0)
+        c = c.expand(n_samples, -1)
 
         z2_loc, z2_scale = self.prior_z2(z1, c)
         z2 = dist.Normal(z2_loc, z2_scale).sample()

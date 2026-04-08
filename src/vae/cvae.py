@@ -17,25 +17,23 @@ from pyro.optim import Adam
 from src.dHSIC import make_elbo_hsic
 from src.vae.utils.vae_plots import plot_llk, plot_vae_samples
 
-X_DIM = 9
-C_DIM = 5
-N_NFEATURES = X_DIM + C_DIM
-
 pyro.set_rng_seed(42)
 torch.manual_seed(42)
 
 
 class Encoder(nn.Module):
-    def __init__(self, z_dim, hidden_dim):
+    def __init__(self, x_dim, c_dim, z_dim, hidden_dim):
         super().__init__()
-        self.fc1 = nn.Linear(N_NFEATURES, hidden_dim)
+        self.x_dim = x_dim
+        self.c_dim = c_dim
+        self.fc1 = nn.Linear(x_dim + c_dim, hidden_dim)
         self.fc21 = nn.Linear(hidden_dim, z_dim)
         self.fc22 = nn.Linear(hidden_dim, z_dim)
         self.softplus = nn.Softplus()
 
     def forward(self, x, c):
-        x = x.reshape(-1, X_DIM)
-        c = c.reshape(-1, C_DIM)
+        x = x.reshape(-1, self.x_dim)
+        c = c.reshape(-1, self.c_dim)
         xc = torch.cat([x, c], dim=-1)
 
         hidden = self.softplus(self.fc1(xc))
@@ -46,15 +44,16 @@ class Encoder(nn.Module):
 
 
 class EncoderNoCond(nn.Module):
-    def __init__(self, z_dim, hidden_dim):
+    def __init__(self, x_dim, z_dim, hidden_dim):
         super().__init__()
-        self.fc1 = nn.Linear(X_DIM, hidden_dim)
+        self.x_dim = x_dim
+        self.fc1 = nn.Linear(x_dim, hidden_dim)
         self.fc21 = nn.Linear(hidden_dim, z_dim)
         self.fc22 = nn.Linear(hidden_dim, z_dim)
         self.softplus = nn.Softplus()
 
     def forward(self, x, _):
-        x = x.reshape(-1, X_DIM)
+        x = x.reshape(-1, self.x_dim)
 
         hidden = self.softplus(self.fc1(x))
         z_loc = self.fc21(hidden)
@@ -63,12 +62,12 @@ class EncoderNoCond(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, z_dim, hidden_dim):
+    def __init__(self, x_dim, z_dim, c_dim, hidden_dim):
         super().__init__()
-        self.fc1 = nn.Linear(z_dim + C_DIM, hidden_dim)
-        self.fc21 = nn.Linear(hidden_dim, X_DIM)
+        self.fc1 = nn.Linear(z_dim + c_dim, hidden_dim)
+        self.fc21 = nn.Linear(hidden_dim, x_dim)
         self.softplus = nn.Softplus()
-        self.log_x_scale = nn.Parameter(torch.zeros(X_DIM))
+        self.log_x_scale = nn.Parameter(torch.zeros(x_dim))
 
     def forward(self, z, c):
         zc = torch.cat([z, c], dim=-1)
@@ -78,14 +77,14 @@ class Decoder(nn.Module):
 
 
 class DecoderVolScaling(nn.Module):
-    def __init__(self, z_dim, hidden_dim):
+    def __init__(self, x_dim, z_dim, c_dim, hidden_dim):
         super().__init__()
-        self.fc1 = nn.Linear(z_dim + C_DIM, hidden_dim)
+        self.fc1 = nn.Linear(z_dim + c_dim, hidden_dim)
         self.softplus = nn.Softplus()
-        self.film_scale = nn.Linear(C_DIM, hidden_dim)
-        self.film_shift = nn.Linear(C_DIM, hidden_dim)
-        self.fc21 = nn.Linear(hidden_dim, X_DIM)
-        self.fc22 = nn.Linear(hidden_dim, X_DIM)
+        self.film_scale = nn.Linear(c_dim, hidden_dim)
+        self.film_shift = nn.Linear(c_dim, hidden_dim)
+        self.fc21 = nn.Linear(hidden_dim, x_dim)
+        self.fc22 = nn.Linear(hidden_dim, x_dim)
 
     def forward(self, z, c):
         zc = torch.cat([z, c], dim=-1)
@@ -99,10 +98,10 @@ class DecoderVolScaling(nn.Module):
 
 
 class LatentScale(nn.Module):
-    def __init__(self, z_dim, hidden_dim=50):
+    def __init__(self, c_dim, z_dim, hidden_dim=50):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(C_DIM, hidden_dim),
+            nn.Linear(c_dim, hidden_dim),
             nn.Softplus(),
             nn.Linear(hidden_dim, z_dim),
         )
@@ -112,10 +111,12 @@ class LatentScale(nn.Module):
 
 
 class CVAE(nn.Module):
-    def __init__(self, z_dim=50, hidden_dim=400, use_cuda=False):
+    def __init__(self, x_dim, c_dim, z_dim=50, hidden_dim=400, use_cuda=False):
         super().__init__()
-        self.encoder = Encoder(z_dim, hidden_dim)
-        self.decoder = Decoder(z_dim, hidden_dim)
+        self.x_dim = x_dim
+        self.c_dim = c_dim
+        self.encoder = Encoder(x_dim, c_dim, z_dim, hidden_dim)
+        self.decoder = Decoder(x_dim, z_dim, c_dim, hidden_dim)
 
         if use_cuda:
             self.cuda()
@@ -138,7 +139,7 @@ class CVAE(nn.Module):
             pyro.sample(
                 "obs",
                 dist.Normal(x_loc, x_scale, validate_args=False).to_event(1),
-                obs=x.reshape(-1, X_DIM),
+                obs=x.reshape(-1, self.x_dim),
             )
             return x_loc
 
@@ -160,18 +161,19 @@ class CVAE(nn.Module):
         x_loc, _ = self.decoder(z_loc, c)
         return x_loc
 
-    def conterfactual_prediction(self, x, c1, c2):
+    def counterfactual_prediction(self, x, c1, c2):
         z_loc, _ = self.encoder(x, c1)
         x_loc, _ = self.decoder(z_loc, c2)
         return x_loc
 
 
 class CVAEVolClustering(nn.Module):
-    def __init__(self, z_dim=50, hidden_dim=400, use_cuda=False):
+    def __init__(self, x_dim, c_dim, z_dim=50, hidden_dim=400, use_cuda=False):
         super().__init__()
-        self.encoder = Encoder(z_dim, hidden_dim)
-        # self.decoder = Decoder(z_dim, hidden_dim)
-        self.decoder = DecoderVolScaling(z_dim, hidden_dim)
+        self.x_dim = x_dim
+        self.c_dim = c_dim
+        self.encoder = Encoder(x_dim, c_dim, z_dim, hidden_dim)
+        self.decoder = DecoderVolScaling(x_dim, z_dim, c_dim, hidden_dim)
 
         if use_cuda:
             self.cuda()
@@ -195,7 +197,7 @@ class CVAEVolClustering(nn.Module):
             pyro.sample(
                 "obs",
                 dist.Normal(x_loc, x_scale, validate_args=False).to_event(1),
-                obs=x.reshape(-1, X_DIM),
+                obs=x.reshape(-1, self.x_dim),
             )
             return x_loc
 
@@ -217,7 +219,7 @@ class CVAEVolClustering(nn.Module):
         x_loc, _ = self.decoder(z_loc, c)
         return x_loc
 
-    def conterfactual_prediction(self, x, c1, c2):
+    def counterfactual_prediction(self, x, c1, c2):
         z_loc, _ = self.encoder(x, c1)
         x_loc, _ = self.decoder(z_loc, c2)
         return x_loc
@@ -229,12 +231,14 @@ class CVAEVolClustering(nn.Module):
 
 
 class CVAEEteroschPrior(nn.Module):
-    def __init__(self, z_dim=50, hidden_dim=400, use_cuda=False):
+    def __init__(self, x_dim, c_dim, z_dim=50, hidden_dim=400, use_cuda=False):
         super().__init__()
-        self.encoder = Encoder(z_dim, hidden_dim)
-        # self.encoder = EncoderNoCond(z_dim, hidden_dim)
-        self.decoder = Decoder(z_dim, hidden_dim)
-        self.prior_scale = LatentScale(z_dim, hidden_dim)
+        self.x_dim = x_dim
+        self.c_dim = c_dim
+        self.encoder = Encoder(x_dim, c_dim, z_dim, hidden_dim)
+        # self.encoder = EncoderNoCond(x_dim, z_dim, hidden_dim)
+        self.decoder = Decoder(x_dim, z_dim, c_dim, hidden_dim)
+        self.prior_scale = LatentScale(c_dim, z_dim, hidden_dim)
 
         if use_cuda:
             self.cuda()
@@ -259,7 +263,7 @@ class CVAEEteroschPrior(nn.Module):
             pyro.sample(
                 "obs",
                 dist.Normal(x_loc, x_scale, validate_args=False).to_event(1),
-                obs=x.reshape(-1, X_DIM),
+                obs=x.reshape(-1, self.x_dim),
             )
             return x_loc
 
@@ -281,7 +285,7 @@ class CVAEEteroschPrior(nn.Module):
         x_loc, _ = self.decoder(z_loc, c)
         return x_loc
 
-    def conterfactual_prediction(self, x, c1, c2):
+    def counterfactual_prediction(self, x, c1, c2):
         z_loc, _ = self.encoder(x, c1)
         x_loc, _ = self.decoder(z_loc, c2)
         return x_loc
@@ -294,6 +298,8 @@ class CVAEEteroschPrior(nn.Module):
 
 def train(
     data_loaders: Iterable,
+    x_dim: int,
+    c_dim: int,
     hidden_dim: int = 50,
     z_dim=2,
     beta=1,
@@ -315,10 +321,14 @@ def train(
 
     # setup the VAE
     if heteroscedastic:
-        # vae = CVAEVolClustering(use_cuda=cuda, z_dim=z_dim, hidden_dim=hidden_dim)
-        vae = CVAEEteroschPrior(use_cuda=cuda, z_dim=z_dim, hidden_dim=hidden_dim)
+        # vae = CVAEVolClustering(x_dim=x_dim, c_dim=c_dim, use_cuda=cuda, z_dim=z_dim, hidden_dim=hidden_dim)
+        vae = CVAEEteroschPrior(
+            x_dim=x_dim, c_dim=c_dim, use_cuda=cuda, z_dim=z_dim, hidden_dim=hidden_dim
+        )
     else:
-        vae = CVAE(use_cuda=cuda, z_dim=z_dim, hidden_dim=hidden_dim)
+        vae = CVAE(
+            x_dim=x_dim, c_dim=c_dim, use_cuda=cuda, z_dim=z_dim, hidden_dim=hidden_dim
+        )
 
     # setup the optimizer
     adam_args = {"lr": learning_rate}

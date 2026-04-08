@@ -16,21 +16,21 @@ from pyro.optim import Adam
 
 from src.vae.utils.vae_plots import mnist_test_tsne, plot_llk, plot_vae_samples
 
-DATA_DIM = 9
 pyro.set_rng_seed(42)
 torch.manual_seed(42)
 
 
 class Encoder(nn.Module):
-    def __init__(self, z_dim, hidden_dim):
+    def __init__(self, x_dim, z_dim, hidden_dim):
         super().__init__()
-        self.fc1 = nn.Linear(DATA_DIM, hidden_dim)
+        self.x_dim = x_dim
+        self.fc1 = nn.Linear(x_dim, hidden_dim)
         self.fc21 = nn.Linear(hidden_dim, z_dim)
         self.fc22 = nn.Linear(hidden_dim, z_dim)
         self.softplus = nn.Softplus()
 
     def forward(self, x):
-        x = x.reshape(-1, DATA_DIM)
+        x = x.reshape(-1, self.x_dim)
         hidden = self.softplus(self.fc1(x))
         z_loc = self.fc21(hidden)
         # z_scale = torch.exp(self.fc22(hidden))
@@ -39,12 +39,13 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, z_dim, hidden_dim):
+    def __init__(self, x_dim, z_dim, hidden_dim):
         super().__init__()
+        self.x_dim = x_dim
         self.fc1 = nn.Linear(z_dim, hidden_dim)
-        self.fc21 = nn.Linear(hidden_dim, DATA_DIM)
+        self.fc21 = nn.Linear(hidden_dim, x_dim)
         self.softplus = nn.Softplus()
-        self.log_x_scale = nn.Parameter(torch.zeros(DATA_DIM))
+        self.log_x_scale = nn.Parameter(torch.zeros(x_dim))
 
     def forward(self, z):
         hidden = self.softplus(self.fc1(z))
@@ -53,15 +54,19 @@ class Decoder(nn.Module):
 
 
 class VAE(nn.Module):
-    def __init__(self, z_dim=50, hidden_dim=400, use_cuda=False):
+    def __init__(
+        self, x_dim, z_dim=50, hidden_dim=400, use_cuda=False, prior_t_df=np.inf
+    ):
         super().__init__()
-        self.encoder = Encoder(z_dim, hidden_dim)
-        self.decoder = Decoder(z_dim, hidden_dim)
+        self.x_dim = x_dim
+        self.encoder = Encoder(x_dim, z_dim, hidden_dim)
+        self.decoder = Decoder(x_dim, z_dim, hidden_dim)
 
         if use_cuda:
             self.cuda()
         self.use_cuda = use_cuda
         self.z_dim = z_dim
+        self.prior_t_df = prior_t_df
 
     # define the model p(x|z)p(z)
     def model(self, x, anneling_factor=1):
@@ -71,7 +76,13 @@ class VAE(nn.Module):
             z_scale = torch.ones(x.shape[0], self.z_dim, dtype=x.dtype, device=x.device)
 
             with pyro.poutine.scale(scale=anneling_factor):
-                z = pyro.sample("latent", dist.Normal(z_loc, z_scale).to_event(1))
+                if np.isinf(self.prior_t_df):
+                    z = pyro.sample("latent", dist.Normal(z_loc, z_scale).to_event(1))
+                else:
+                    z = pyro.sample(
+                        "latent",
+                        dist.StudentT(self.prior_t_df, z_loc, z_scale).to_event(1),
+                    )
 
             # decode the latent code z
             x_loc, log_x_scale = self.decoder.forward(z)
@@ -81,7 +92,7 @@ class VAE(nn.Module):
             pyro.sample(
                 "obs",
                 dist.Normal(x_loc, x_scale, validate_args=False).to_event(1),
-                obs=x.reshape(-1, DATA_DIM),
+                obs=x.reshape(-1, self.x_dim),
             )
             # return the loc so we can visualize it later
             return x_loc
@@ -95,7 +106,13 @@ class VAE(nn.Module):
             z_loc, z_scale = self.encoder.forward(x)
             # sample the latent code z
             with pyro.poutine.scale(scale=anneling_factor):
-                pyro.sample("latent", dist.Normal(z_loc, z_scale).to_event(1))
+                if np.isinf(self.prior_t_df):
+                    pyro.sample("latent", dist.Normal(z_loc, z_scale).to_event(1))
+                else:
+                    pyro.sample(
+                        "latent",
+                        dist.StudentT(self.prior_t_df, z_loc, z_scale).to_event(1),
+                    )
 
     # define a helper function for reconstructing images
     def reconstruct(self, x):
@@ -114,6 +131,7 @@ class VAE(nn.Module):
 
 def train(
     data_loaders: Iterable,
+    x_dim: int,
     hidden_dim: int = 50,
     z_dim=2,
     beta=1,
@@ -125,6 +143,7 @@ def train(
     jit=False,
     visdom_flag=False,
     tsne_iter=100,
+    prior_t_df=np.inf,
 ):
     # clear param store
     pyro.clear_param_store()
@@ -132,7 +151,13 @@ def train(
     train_loader, test_loader = data_loaders
 
     # setup the VAE
-    vae = VAE(use_cuda=cuda, z_dim=z_dim, hidden_dim=hidden_dim)
+    vae = VAE(
+        x_dim=x_dim,
+        use_cuda=cuda,
+        z_dim=z_dim,
+        hidden_dim=hidden_dim,
+        prior_t_df=prior_t_df,
+    )
 
     # setup the optimizer
     adam_args = {"lr": learning_rate}

@@ -7,7 +7,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 
 
-class YieldDataCVAE(Dataset):
+class ConditionalDataset(Dataset):
     def __init__(self, x, c):
         self.tds = TensorDataset(
             torch.tensor(x, dtype=torch.float32), torch.tensor(c, dtype=torch.float32)
@@ -21,8 +21,8 @@ class YieldDataCVAE(Dataset):
         return x, c
 
 
-class IVDataHVAE(Dataset):
-    """Dataset yielding (x1, c1, x2, c2) tuples for the hierarchical VAE.
+class HierarchicalDataset(Dataset):
+    """Dataset yielding (x1, c1, x2, c2) tuples for hierarchical models.
 
     Each sample pairs one OMX observation (x1) with one single-name
     observation (x2) on the same date.  c1 contains OMX t-1 levels;
@@ -101,7 +101,7 @@ def attach_conditional_features(
     return output
 
 
-def load_yeld_data_vae(
+def load_yield_data_vae(
     file_path: Path,
     batch_size: int = 256,
     train_split: float = 0.8,
@@ -128,7 +128,7 @@ def load_yeld_data_vae(
     return dataloaders, original.columns.tolist(), processed
 
 
-def load_yeld_data_cvae(
+def load_yield_data_cvae(
     file_path: Path,
     batch_size: int = 256,
     train_split: float = 0.8,
@@ -147,7 +147,7 @@ def load_yeld_data_cvae(
     ]
 
     def make_loader(data: dict, shuffle: bool):
-        dataset = YieldDataCVAE(data["X"], data["C"])
+        dataset = ConditionalDataset(data["X"], data["C"])
         return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
 
     dataloaders = {}
@@ -384,7 +384,9 @@ def load_iv_data_hvae(
 
     # --- data loaders --------------------------------------------------------
     def make_loader(data, shuffle):
-        return DataLoader(IVDataHVAE(*data), batch_size=batch_size, shuffle=shuffle)
+        return DataLoader(
+            HierarchicalDataset(*data), batch_size=batch_size, shuffle=shuffle
+        )
 
     dataloaders = {m: make_loader(splits[m], m == "train") for m in splits}
 

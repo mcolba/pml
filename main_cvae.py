@@ -9,7 +9,7 @@ import torch
 from pyparsing import col
 from sklearn.decomposition import PCA
 
-from src.data_loaders import load_yeld_data_cvae
+from src.data_loaders import load_yield_data_cvae
 from src.plot_helper import (
     cvae_encode_all,
     latent_space_scatter_cvae,
@@ -32,7 +32,7 @@ if __name__ == "__main__":
     num_epochs = 100 if heteroscedastic else 150
     c_ref_col = 4
 
-    loaders, tenors, data = load_yeld_data_cvae(
+    loaders, tenors, data = load_yield_data_cvae(
         file_path=path,
         batch_size=256,
         changes=True,
@@ -48,6 +48,8 @@ if __name__ == "__main__":
     # train VAE
     vae = train(
         data_loaders=(train_loader, test_loader),
+        x_dim=len(tenors),
+        c_dim=5,
         beta=1.5,
         anneling_start=0,
         z_dim=2,
