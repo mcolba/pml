@@ -39,7 +39,7 @@ if __name__ == "__main__":
         data_loaders=(train_loader, test_loader),
         x_dim=len(tenors),
         beta=1.5,
-        anneling_start=0,
+        annealing_start=0,
         z_dim=2,
         hidden_dim=50,
         num_epochs=80,
