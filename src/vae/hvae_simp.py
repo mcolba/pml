@@ -15,145 +15,96 @@ torch.manual_seed(42)
 
 
 # ---------------------------------------------------------------------------
-# Stage-1 components  (standard VAE for x1)
+# Components
 # ---------------------------------------------------------------------------
 
 
-class Encoder1(nn.Module):
-    """q(z1 | x1)"""
+class ConditionalPrior(nn.Module):
+    """p(z | x1, c) — learned conditional prior."""
 
-    def __init__(self, x1_dim, z1_dim, hidden_dim):
+    def __init__(self, x1_dim, c_dim, z_dim, hidden_dim):
         super().__init__()
-        self.fc1 = nn.Linear(x1_dim, hidden_dim)
-        self.fc_loc = nn.Linear(hidden_dim, z1_dim)
-        self.fc_scale = nn.Linear(hidden_dim, z1_dim)
-        self.softplus = nn.Softplus()
-
-    def forward(self, x1):
-        x1 = x1.reshape(-1, self.fc1.in_features)
-        hidden = self.softplus(self.fc1(x1))
-        z_loc = self.fc_loc(hidden)
-        z_scale = F.softplus(self.fc_scale(hidden)) + 1e-4
-        return z_loc, z_scale
-
-
-class Decoder1(nn.Module):
-    """p(x1 | z1)"""
-
-    def __init__(self, x1_dim, z1_dim, hidden_dim):
-        super().__init__()
-        self.fc1 = nn.Linear(z1_dim, hidden_dim)
-        self.fc_loc = nn.Linear(hidden_dim, x1_dim)
-        self.softplus = nn.Softplus()
-        self.log_x_scale = nn.Parameter(torch.zeros(x1_dim))
-
-    def forward(self, z):
-        hidden = self.softplus(self.fc1(z))
-        x_loc = self.fc_loc(hidden)
-        return x_loc, self.log_x_scale.expand_as(x_loc)
-
-
-# ---------------------------------------------------------------------------
-# Conditional prior for z2  (learned p(z2 | z1, C))
-# ---------------------------------------------------------------------------
-
-
-class PriorZ2(nn.Module):
-    """p(z2 | z1, C) — learned conditional prior for the second latent layer."""
-
-    def __init__(self, z1_dim, c_dim, z2_dim, hidden_dim):
-        super().__init__()
-        in_dim = z1_dim + c_dim
+        in_dim = x1_dim + c_dim
         self.fc1 = nn.Linear(in_dim, hidden_dim)
-        self.fc_loc = nn.Linear(hidden_dim, z2_dim)
-        self.fc_scale = nn.Linear(hidden_dim, z2_dim)
+        self.fc_loc = nn.Linear(hidden_dim, z_dim)
+        self.fc_scale = nn.Linear(hidden_dim, z_dim)
         self.softplus = nn.Softplus()
 
-    def forward(self, z1, c):
-        z1 = z1.reshape(-1, z1.shape[-1])
+    def forward(self, x1, c):
+        x1 = x1.reshape(-1, x1.shape[-1])
         c = c.reshape(-1, c.shape[-1])
-        inp = torch.cat([z1, c], dim=-1)
+        inp = torch.cat([x1, c], dim=-1)
         hidden = self.softplus(self.fc1(inp))
         z_loc = self.fc_loc(hidden)
         z_scale = F.softplus(self.fc_scale(hidden)) + 1e-4
         return z_loc, z_scale
 
 
-# ---------------------------------------------------------------------------
-# Stage-2 components  (conditional VAE for x2 given z1 and C)
-# ---------------------------------------------------------------------------
+class Encoder(nn.Module):
+    """q(z | x2, x1, c)"""
 
-
-class Encoder2(nn.Module):
-    """q(z2 | x2, z1, C)"""
-
-    def __init__(self, x2_dim, z1_dim, c_dim, z2_dim, hidden_dim):
+    def __init__(self, x2_dim, x1_dim, c_dim, z_dim, hidden_dim):
         super().__init__()
-        in_dim = x2_dim + z1_dim + c_dim
+        in_dim = x2_dim + x1_dim + c_dim
         self.fc1 = nn.Linear(in_dim, hidden_dim)
-        self.fc_loc = nn.Linear(hidden_dim, z2_dim)
-        self.fc_scale = nn.Linear(hidden_dim, z2_dim)
+        self.fc_loc = nn.Linear(hidden_dim, z_dim)
+        self.fc_scale = nn.Linear(hidden_dim, z_dim)
         self.softplus = nn.Softplus()
         self.x2_dim = x2_dim
 
-    def forward(self, x2, z1, c):
+    def forward(self, x2, x1, c):
         x2 = x2.reshape(-1, self.x2_dim)
-        z1 = z1.reshape(-1, z1.shape[-1])
+        x1 = x1.reshape(-1, x1.shape[-1])
         c = c.reshape(-1, c.shape[-1])
-        xzc = torch.cat([x2, z1, c], dim=-1)
-        hidden = self.softplus(self.fc1(xzc))
+        inp = torch.cat([x2, x1, c], dim=-1)
+        hidden = self.softplus(self.fc1(inp))
         z_loc = self.fc_loc(hidden)
         z_scale = F.softplus(self.fc_scale(hidden)) + 1e-4
         return z_loc, z_scale
 
 
-class Decoder2(nn.Module):
-    """p(x2 | z2, z1, C)"""
+class Decoder(nn.Module):
+    """p(x2 | z, x1, c)"""
 
-    def __init__(self, x2_dim, z1_dim, z2_dim, c_dim, hidden_dim):
+    def __init__(self, x2_dim, z_dim, x1_dim, c_dim, hidden_dim):
         super().__init__()
-        in_dim = z2_dim + z1_dim + c_dim
+        in_dim = z_dim + x1_dim + c_dim
         self.fc1 = nn.Linear(in_dim, hidden_dim)
         self.fc_loc = nn.Linear(hidden_dim, x2_dim)
         self.softplus = nn.Softplus()
         self.log_x_scale = nn.Parameter(torch.zeros(x2_dim))
 
-    def forward(self, z2, z1, c):
-        inp = torch.cat([z2, z1, c], dim=-1)
+    def forward(self, z, x1, c):
+        inp = torch.cat([z, x1, c], dim=-1)
         hidden = self.softplus(self.fc1(inp))
         x_loc = self.fc_loc(hidden)
         return x_loc, self.log_x_scale.expand_as(x_loc)
 
 
 # ---------------------------------------------------------------------------
-# Hierarchical VAE
+# Hierarchical VAE  (d-separated: x1 is observed conditioning, not modeled)
 # ---------------------------------------------------------------------------
 
 
 class HierarchicalVAE(nn.Module):
     """
-    Two-level hierarchical VAE with a learned conditional prior on z2.
+    Conditional VAE for x2 given observed x1 and conditioning c.
+
+    By removing the shared latent z1, the model treats x1 as an observed
+    conditioning variable rather than modeling it generatively.  All
+    information from x1 flows through (x1, c) → z → x2, with x1 also
+    feeding the decoder directly for expressiveness.
 
     Generative model:
-        z1  ~ p(z1)                    (standard normal)
-        x1  ~ p(x1 | z1)
-        z2  ~ p(z2 | z1, c)            (learned conditional prior)
-        x2  ~ p(x2 | z2, z1, c)
+        z   ~ p(z | x1, c)              (learned conditional prior)
+        x2  ~ p(x2 | z, x1, c)
 
     Inference (guide):
-        q(z1 | x1)                     z1 is inferred from x1 alone
-        q(z2 | x2, z1, c)              z2 posterior uses observed x2
-
-    The two stages share a single Pyro model / guide so that the whole
-    hierarchy is optimised end-to-end with a single ELBO.  Although q(z1|x1)
-    only reads x1, the stage-2 likelihood p(x2|z2,z1,c) shapes the learned
-    z1 representation through gradients that back-propagate from the ELBO
-    into the shared z1 sample.
+        q(z | x2, x1, c)
 
     Predicting x2 from x1 alone (without observing x2):
-        1. Encode  z1 ~ q(z1 | x1)
-        2. Sample  z2 ~ p(z2 | z1, c)   (conditional prior, no x2 needed)
-        3. Decode  x2 ~ p(x2 | z2, z1, c)
+        1. Compute  z_loc = E[z | x1, c]  from the conditional prior
+        2. Decode   x2 ~ p(x2 | z_loc, x1, c)
     See :meth:`sample_x2` and :meth:`predict_x2`.
     """
 
@@ -162,8 +113,7 @@ class HierarchicalVAE(nn.Module):
         x1_dim: int,
         x2_dim: int,
         c_dim: int,
-        z1_dim: int = 2,
-        z2_dim: int = 2,
+        z_dim: int = 2,
         hidden_dim: int = 50,
         use_cuda: bool = False,
     ):
@@ -171,17 +121,11 @@ class HierarchicalVAE(nn.Module):
         self.x1_dim = x1_dim
         self.x2_dim = x2_dim
         self.c_dim = c_dim
-        self.z1_dim = z1_dim
-        self.z2_dim = z2_dim
+        self.z_dim = z_dim
 
-        # stage-1
-        self.encoder1 = Encoder1(x1_dim, z1_dim, hidden_dim)
-        self.decoder1 = Decoder1(x1_dim, z1_dim, hidden_dim)
-
-        # stage-2
-        self.encoder2 = Encoder2(x2_dim, z1_dim, c_dim, z2_dim, hidden_dim)
-        self.decoder2 = Decoder2(x2_dim, z1_dim, z2_dim, c_dim, hidden_dim)
-        self.prior_z2 = PriorZ2(z1_dim, c_dim, z2_dim, hidden_dim)
+        self.encoder = Encoder(x2_dim, x1_dim, c_dim, z_dim, hidden_dim)
+        self.decoder = Decoder(x2_dim, z_dim, x1_dim, c_dim, hidden_dim)
+        self.prior_z = ConditionalPrior(x1_dim, c_dim, z_dim, hidden_dim)
 
         self.use_cuda = use_cuda
         if use_cuda:
@@ -190,40 +134,19 @@ class HierarchicalVAE(nn.Module):
     # ---- Pyro model / guide ------------------------------------------------
 
     def model(self, x1, x2, c2, annealing_factor=1.0):
-        pyro.module("decoder1", self.decoder1)
-        pyro.module("decoder2", self.decoder2)
-        pyro.module("prior_z2", self.prior_z2)
+        pyro.module("decoder", self.decoder)
+        pyro.module("prior_z", self.prior_z)
 
         batch_size = x1.shape[0]
 
         with pyro.plate("data", batch_size):
-            # --- Stage-1 prior & likelihood ---
-            z1_loc = torch.zeros(
-                batch_size, self.z1_dim, dtype=x1.dtype, device=x1.device
-            )
-            z1_scale = torch.ones(
-                batch_size, self.z1_dim, dtype=x1.dtype, device=x1.device
-            )
+            # --- Conditional prior & likelihood ---
+            z_loc, z_scale = self.prior_z(x1, c2)
 
             with pyro.poutine.scale(scale=annealing_factor):
-                z1 = pyro.sample("z1", dist.Normal(z1_loc, z1_scale).to_event(1))
+                z = pyro.sample("z", dist.Normal(z_loc, z_scale).to_event(1))
 
-            x1_loc, log_x1_scale = self.decoder1(z1)
-            x1_scale = torch.exp(log_x1_scale)
-
-            pyro.sample(
-                "obs_x1",
-                dist.Normal(x1_loc, x1_scale, validate_args=False).to_event(1),
-                obs=x1.reshape(-1, self.x1_dim),
-            )
-
-            # --- Stage-2 conditional prior & likelihood ---
-            z2_loc, z2_scale = self.prior_z2(z1, c2)
-
-            with pyro.poutine.scale(scale=annealing_factor):
-                z2 = pyro.sample("z2", dist.Normal(z2_loc, z2_scale).to_event(1))
-
-            x2_loc, log_x2_scale = self.decoder2(z2, z1, c2)
+            x2_loc, log_x2_scale = self.decoder(z, x1, c2)
             x2_scale = torch.exp(log_x2_scale)
 
             pyro.sample(
@@ -232,76 +155,57 @@ class HierarchicalVAE(nn.Module):
                 obs=x2.reshape(-1, self.x2_dim),
             )
 
-        return x1_loc, x2_loc
+        return x2_loc
 
     def guide(self, x1, x2, c2, annealing_factor=1.0):
-        pyro.module("encoder1", self.encoder1)
-        pyro.module("encoder2", self.encoder2)
+        pyro.module("encoder", self.encoder)
 
         with pyro.plate("data", x1.shape[0]):
-            # --- Stage-1 posterior ---
-            z1_loc, z1_scale = self.encoder1(x1)
+            z_loc, z_scale = self.encoder(x2, x1, c2)
             with pyro.poutine.scale(scale=annealing_factor):
-                z1 = pyro.sample("z1", dist.Normal(z1_loc, z1_scale).to_event(1))
-
-            # --- Stage-2 posterior (conditioned on z1) ---
-            z2_loc, z2_scale = self.encoder2(x2, z1, c2)
-            with pyro.poutine.scale(scale=annealing_factor):
-                pyro.sample("z2", dist.Normal(z2_loc, z2_scale).to_event(1))
+                pyro.sample("z", dist.Normal(z_loc, z_scale).to_event(1))
 
     # ---- Inference helpers --------------------------------------------------
 
     def reconstruct(self, x1, x2, c2):
-        """Stochastic reconstruction of both x1 and x2."""
-        z1_loc, z1_scale = self.encoder1(x1)
-        z1 = dist.Normal(z1_loc, z1_scale).sample()
-        x1_loc, _ = self.decoder1(z1)
-
-        z2_loc, z2_scale = self.encoder2(x2, z1, c2)
-        z2 = dist.Normal(z2_loc, z2_scale).sample()
-        x2_loc, _ = self.decoder2(z2, z1, c2)
-        return x1_loc, x2_loc
+        """Stochastic reconstruction of x2 (x1 is returned unchanged)."""
+        z_loc, z_scale = self.encoder(x2, x1, c2)
+        z = dist.Normal(z_loc, z_scale).sample()
+        x2_loc, _ = self.decoder(z, x1, c2)
+        return x1, x2_loc
 
     def reconstruct_map(self, x1, x2, c2):
-        """MAP (mean) reconstruction – no sampling noise."""
-        z1_loc, _ = self.encoder1(x1)
-        x1_loc, _ = self.decoder1(z1_loc)
-
-        z2_loc, _ = self.encoder2(x2, z1_loc, c2)
-        x2_loc, _ = self.decoder2(z2_loc, z1_loc, c2)
-        return x1_loc, x2_loc
+        """MAP (mean) reconstruction — no sampling noise. x1 returned unchanged."""
+        z_loc, _ = self.encoder(x2, x1, c2)
+        x2_loc, _ = self.decoder(z_loc, x1, c2)
+        return x1, x2_loc
 
     def counterfactual_prediction(self, x1, c2_new):
         """
         Predict x2 under a new condition without observing x2.
 
-        Infers z1 from x1, draws z2 from the conditional prior
-        p(z2 | z1, c2_new), and decodes x2.  Uses the prior *mean*
-        for z2 (MAP estimate), so the output is deterministic.
+        Uses the conditional prior p(z | x1, c2_new) mean and decodes.
+        x1 is returned unchanged.
         """
-        z1_loc, _ = self.encoder1(x1)
-        z2_loc, _ = self.prior_z2(z1_loc, c2_new)
-        x2_loc, _ = self.decoder2(z2_loc, z1_loc, c2_new)
-        x1_loc, _ = self.decoder1(z1_loc)
-        return x1_loc, x2_loc
+        z_loc, _ = self.prior_z(x1, c2_new)
+        x2_loc, _ = self.decoder(z_loc, x1, c2_new)
+        return x1, x2_loc
 
     def predict_x2(self, x1, c2):
         """
         MAP prediction of x2 from x1 and condition c2 (no x2 observed).
 
-        Uses the posterior mean for z1 and the conditional prior mean
-        for z2, so the output is fully deterministic.
+        Uses the conditional prior mean for z, so the output is
+        fully deterministic.
         """
-        z1_loc, _ = self.encoder1(x1)
-        z2_loc, _ = self.prior_z2(z1_loc, c2)
-        x2_loc, _ = self.decoder2(z2_loc, z1_loc, c2)
+        z_loc, _ = self.prior_z(x1, c2)
+        x2_loc, _ = self.decoder(z_loc, x1, c2)
         return x2_loc
 
     def encode(self, x1, x2, c2):
-        """Return posterior means for both latent layers."""
-        z1_loc, _ = self.encoder1(x1)
-        z2_loc, _ = self.encoder2(x2, z1_loc, c2)
-        return z1_loc, z2_loc
+        """Return posterior mean for the latent z."""
+        z_loc, _ = self.encoder(x2, x1, c2)
+        return z_loc
 
     def sample_x2(self, x1, c2, n_samples=1):
         """
@@ -317,16 +221,15 @@ class HierarchicalVAE(nn.Module):
             x1 = x1.unsqueeze(0)
             c2 = c2.unsqueeze(0)
 
-        z1_loc, _ = self.encoder1(x1)  # (B, z1_dim)
-        B = z1_loc.shape[0]
+        B = x1.shape[0]
 
         # Repeat each sample n_samples times: (B*n_samples, dim)
-        z1_exp = z1_loc.unsqueeze(1).expand(B, n_samples, -1).reshape(B * n_samples, -1)
+        x1_exp = x1.unsqueeze(1).expand(B, n_samples, -1).reshape(B * n_samples, -1)
         c2_exp = c2.unsqueeze(1).expand(B, n_samples, -1).reshape(B * n_samples, -1)
 
-        z2_loc, z2_scale = self.prior_z2(z1_exp, c2_exp)
-        z2 = dist.Normal(z2_loc, z2_scale).sample()
-        x2_loc, _ = self.decoder2(z2, z1_exp, c2_exp)
+        z_loc, z_scale = self.prior_z(x1_exp, c2_exp)
+        z = dist.Normal(z_loc, z_scale).sample()
+        x2_loc, _ = self.decoder(z, x1_exp, c2_exp)
 
         x2_loc = x2_loc.reshape(B, n_samples, -1)
         if squeeze:
@@ -344,8 +247,7 @@ def train(
     x1_dim: int,
     x2_dim: int,
     c_dim: int,
-    z1_dim: int = 2,
-    z2_dim: int = 2,
+    z_dim: int = 2,
     hidden_dim: int = 50,
     beta: float = 1.0,
     annealing_start: float = 1.0,
@@ -362,8 +264,7 @@ def train(
         x1_dim=x1_dim,
         x2_dim=x2_dim,
         c_dim=c_dim,
-        z1_dim=z1_dim,
-        z2_dim=z2_dim,
+        z_dim=z_dim,
         hidden_dim=hidden_dim,
         use_cuda=cuda,
     )

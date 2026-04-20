@@ -4,7 +4,6 @@
 
 from typing import Iterable
 
-import numpy as np
 import pyro
 import pyro.distributions as dist
 import torch
@@ -96,6 +95,25 @@ class DecoderVolScaling(nn.Module):
         return x_loc, x_log_scale
 
 
+class PriorNetwork(nn.Module):
+    def __init__(self, c_dim, z_dim, hidden_dim=50):
+        super().__init__()
+        self.c_dim = c_dim
+        self.net = nn.Sequential(
+            nn.Linear(c_dim, hidden_dim),
+            nn.Softplus(),
+        )
+        self.fc_loc = nn.Linear(hidden_dim, z_dim)
+        self.fc_scale = nn.Linear(hidden_dim, z_dim)
+
+    def forward(self, c):
+        c = c.reshape(-1, self.c_dim)
+        hidden = self.net(c)
+        z_loc = self.fc_loc(hidden)
+        z_scale = F.softplus(self.fc_scale(hidden)) + 1e-4
+        return z_loc, z_scale
+
+
 class LatentScale(nn.Module):
     def __init__(self, c_dim, z_dim, hidden_dim=50):
         super().__init__()
@@ -116,6 +134,7 @@ class CVAE(nn.Module):
         self.c_dim = c_dim
         self.encoder = Encoder(x_dim, c_dim, z_dim, hidden_dim)
         self.decoder = Decoder(x_dim, z_dim, c_dim, hidden_dim)
+        self.prior_network = PriorNetwork(c_dim, z_dim, hidden_dim)
 
         if use_cuda:
             self.cuda()
@@ -125,9 +144,9 @@ class CVAE(nn.Module):
 
     def model(self, x, c, annealing_factor=1):
         pyro.module("decoder", self.decoder)
+        pyro.module("prior_network", self.prior_network)
         with pyro.plate("data", x.shape[0]):
-            z_loc = torch.zeros(x.shape[0], self.z_dim, dtype=x.dtype, device=x.device)
-            z_scale = torch.ones(x.shape[0], self.z_dim, dtype=x.dtype, device=x.device)
+            z_loc, z_scale = self.prior_network(c)
 
             with pyro.poutine.scale(scale=annealing_factor):
                 z = pyro.sample("latent", dist.Normal(z_loc, z_scale).to_event(1))
@@ -224,14 +243,12 @@ class CVAEVolClustering(nn.Module):
         return x_loc
 
 
-
 class CVAEEteroschPrior(nn.Module):
     def __init__(self, x_dim, c_dim, z_dim=50, hidden_dim=400, use_cuda=False):
         super().__init__()
         self.x_dim = x_dim
         self.c_dim = c_dim
         self.encoder = Encoder(x_dim, c_dim, z_dim, hidden_dim)
-        # self.encoder = EncoderNoCond(x_dim, z_dim, hidden_dim)
         self.decoder = Decoder(x_dim, z_dim, c_dim, hidden_dim)
         self.prior_scale = LatentScale(c_dim, z_dim, hidden_dim)
 
