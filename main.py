@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from src.data_loaders import load_yield_data_vae
+from src.data.data_loaders import load_yield_data_vae
 from src.plot_helper import (
     plot_latent_space,
     show_latent_manifold_6x6,

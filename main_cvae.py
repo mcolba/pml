@@ -9,7 +9,7 @@ import torch
 from pyparsing import col
 from sklearn.decomposition import PCA
 
-from src.data_loaders import load_yield_data_cvae
+from src.data.data_loaders import load_yield_data_cvae
 from src.plot_helper import (
     cvae_encode_all,
     latent_space_scatter_cvae,
