@@ -24,7 +24,7 @@ Generative model:
     x2_t_n      ~ p(x2 | z2_t_n, z1_t, c2_t_n, z_private_t_n) [dates × children]
 
 Inference:
-    q(z1_t        | x1_t)                  [dates plate]
+    q(z1_t        | x1_t [, {x2_t_n, c2_t_n}]) [dates plate]
     q(z2_t_n      | x2_t_n, z1_t, c2_t_n)  [dates × children]
     q(z_private_t_n | x2_t_n, c2_t_n)       [dates × children]
 
@@ -79,7 +79,9 @@ class PrivateEncoder(nn.Module):
         self.fc_loc = nn.Linear(hidden_dim, z_private_dim)
         self.fc_scale = nn.Linear(hidden_dim, z_private_dim)
 
-    def forward(self, x2, c2):
+    def forward(
+        self, x2: torch.Tensor, c2: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         inp = torch.cat([x2, c2], dim=-1)
         hidden = F.softplus(self.fc1(inp))
         zp_loc = self.fc_loc(hidden)
@@ -104,7 +106,13 @@ class ChildDecoderPS(nn.Module):
         self.fc_loc = nn.Linear(hidden_dim, x2_dim)
         self.log_x_scale = nn.Parameter(torch.zeros(x2_dim))
 
-    def forward(self, z2, z1, c2, z_private):
+    def forward(
+        self,
+        z2: torch.Tensor,
+        z1: torch.Tensor,
+        c2: torch.Tensor,
+        z_private: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         inp = torch.cat([z2, z1, c2, z_private], dim=-1)
         hidden = F.softplus(self.fc1(inp))
         x_loc = self.fc_loc(hidden)
@@ -158,10 +166,11 @@ class HierarchicalPSVAE(nn.Module):
         hidden_dim : int
             Hidden dimension for encoder/decoder networks.
         set_encoder : nn.Module, optional
-            Set encoder for aggregating child observations into a summary.
-            If provided, the global encoder receives [x1, set_summary].
-            Must have an `output_dim` attribute specifying output size.
-            If None, only x1 is used for the global encoder.
+            Set encoder for aggregating child pairs ``(x2, c2)`` into a
+            summary. If provided, the global encoder receives
+            ``[x1, set_summary]``. Must have an `output_dim` attribute
+            specifying output size. If None, only x1 is used for the global
+            encoder.
         z1_input : ParentEncoderInput, optional
             Full control over parent encoder input composition.
             If provided, overrides `set_encoder`.
@@ -310,7 +319,7 @@ class HierarchicalPSVAE(nn.Module):
         N_max = x2.shape[1]
 
         # Compute z1 encoder input (deterministic, outside plates)
-        z1_encoder_input = self.z1_input(x1, x2, child_mask)
+        z1_encoder_input = self.z1_input(x1, x2, child_mask, c2_set=c2)
 
         with pyro.plate("dates", B, dim=-2):
             # ── global posterior q(z1 | x1 [, {x2}]) ──
@@ -348,49 +357,43 @@ class HierarchicalPSVAE(nn.Module):
                             "z_private", dist.Normal(zp_loc, zp_scale).to_event(1)
                         )
 
-    def encode_z(self, x1, x2_set=None, child_mask=None):
-        """Return posterior mean of global latent z1 from Index observation."""
-        encoder_input = self.z1_input(x1, x2_set, child_mask)
+    def encode_z(
+        self,
+        x1: torch.Tensor,
+        x2_set: torch.Tensor | None = None,
+        child_mask: torch.Tensor | None = None,
+        c2_set: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return the posterior mean of the global latent from x1 and optional child context."""
+        encoder_input = self.z1_input(x1, x2_set, child_mask, c2_set=c2_set)
         z1_loc, _ = self.index_encoder(encoder_input)
         return z1_loc
 
-    def predict_x2(self, x1, c2_target, x2_set=None, child_mask=None):
-        """
-        MAP prediction: z_private set to prior mean (zero).
-
-        Parameters
-        ----------
-        x1 : Tensor (B, x1_dim)
-        c2_target : Tensor (B, c2_dim)
-        x2_set : Tensor (B, N, x2_dim), optional
-        child_mask : Tensor (B, N), optional
-
-        Returns
-        -------
-        x2_loc : Tensor (B, x2_dim)
-        """
-        z1_loc = self.encode_z(x1, x2_set, child_mask)
+    def predict_x2(
+        self,
+        x1: torch.Tensor,
+        c2_target: torch.Tensor,
+        x2_set: torch.Tensor | None = None,
+        child_mask: torch.Tensor | None = None,
+        c2_set: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return the MAP child prediction from x1, target c2, and optional child context."""
+        z1_loc = self.encode_z(x1, x2_set, child_mask, c2_set)
         z2_loc, _ = self.child_prior(z1_loc, c2_target)
         zp_zero = z1_loc.new_zeros(z1_loc.shape[0], self.z_private_dim)
         x2_loc, _ = self.child_decoder(z2_loc, z1_loc, c2_target, zp_zero)
         return x2_loc
 
-    def sample_x2(self, x1, c2_target, n_samples=1, x2_set=None, child_mask=None):
-        """
-        Stochastic samples: z2 from conditional prior, z_private from N(0,I).
-
-        Parameters
-        ----------
-        x1 : Tensor (B, x1_dim) or (x1_dim,)
-        c2_target : Tensor (B, c2_dim) or (c2_dim,)
-        n_samples : int
-        x2_set : Tensor (B, N, x2_dim), optional
-        child_mask : Tensor (B, N), optional
-
-        Returns
-        -------
-        x2_samples : Tensor (B, n_samples, x2_dim) or (n_samples, x2_dim)
-        """
+    def sample_x2(
+        self,
+        x1: torch.Tensor,
+        c2_target: torch.Tensor,
+        n_samples: int = 1,
+        x2_set: torch.Tensor | None = None,
+        child_mask: torch.Tensor | None = None,
+        c2_set: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Sample child reconstructions conditioned on x1, target c2, and optional child context."""
         squeeze = x1.dim() == 1
         if squeeze:
             x1 = x1.unsqueeze(0)
@@ -399,8 +402,10 @@ class HierarchicalPSVAE(nn.Module):
                 x2_set = x2_set.unsqueeze(0)
             if child_mask is not None:
                 child_mask = child_mask.unsqueeze(0)
+            if c2_set is not None:
+                c2_set = c2_set.unsqueeze(0)
 
-        z1_loc = self.encode_z(x1, x2_set, child_mask)
+        z1_loc = self.encode_z(x1, x2_set, child_mask, c2_set)
         B = z1_loc.shape[0]
 
         z1_exp = z1_loc.unsqueeze(1).expand(B, n_samples, -1).reshape(B * n_samples, -1)
@@ -421,19 +426,17 @@ class HierarchicalPSVAE(nn.Module):
             x2_loc = x2_loc.squeeze(0)
         return x2_loc
 
-    def reconstruct(self, x1, x2, c2, x2_set=None, child_mask=None):
-        """
-        Stochastic reconstruction of x1 and a single child x2.
-
-        Parameters
-        ----------
-        x1 : Tensor (B, x1_dim)
-        x2 : Tensor (B, x2_dim)  — single child (not padded)
-        c2 : Tensor (B, c2_dim)
-        x2_set : Tensor (B, N, x2_dim), optional
-        child_mask : Tensor (B, N), optional
-        """
-        encoder_input = self.z1_input(x1, x2_set, child_mask)
+    def reconstruct(
+        self,
+        x1: torch.Tensor,
+        x2: torch.Tensor,
+        c2: torch.Tensor,
+        x2_set: torch.Tensor | None = None,
+        child_mask: torch.Tensor | None = None,
+        c2_set: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return a stochastic reconstruction of x1 and one child observation."""
+        encoder_input = self.z1_input(x1, x2_set, child_mask, c2_set=c2_set)
         z1_loc, z1_scale = self.index_encoder(encoder_input)
         z1 = dist.Normal(z1_loc, z1_scale).sample()
         x1_loc, _ = self.index_decoder(z1)
@@ -447,9 +450,17 @@ class HierarchicalPSVAE(nn.Module):
         x2_loc, _ = self.child_decoder(z2, z1, c2, z_private)
         return x1_loc, x2_loc
 
-    def reconstruct_map(self, x1, x2, c2, x2_set=None, child_mask=None):
-        """MAP reconstruction — no sampling noise."""
-        encoder_input = self.z1_input(x1, x2_set, child_mask)
+    def reconstruct_map(
+        self,
+        x1: torch.Tensor,
+        x2: torch.Tensor,
+        c2: torch.Tensor,
+        x2_set: torch.Tensor | None = None,
+        child_mask: torch.Tensor | None = None,
+        c2_set: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the deterministic reconstruction of x1 and one child observation."""
+        encoder_input = self.z1_input(x1, x2_set, child_mask, c2_set=c2_set)
         z1_loc, _ = self.index_encoder(encoder_input)
         x1_loc, _ = self.index_decoder(z1_loc)
 
@@ -458,22 +469,33 @@ class HierarchicalPSVAE(nn.Module):
         x2_loc, _ = self.child_decoder(z2_loc, z1_loc, c2, zp_loc)
         return x1_loc, x2_loc
 
-    def counterfactual_prediction(self, x1, c2_new, x2_set=None, child_mask=None):
-        """
-        Predict x2 under a new conditioning without observing x2.
-
-        z_private set to prior mean (zero) since x2 is not observed.
-        """
-        z1_loc = self.encode_z(x1, x2_set, child_mask)
+    def counterfactual_prediction(
+        self,
+        x1: torch.Tensor,
+        c2_new: torch.Tensor,
+        x2_set: torch.Tensor | None = None,
+        child_mask: torch.Tensor | None = None,
+        c2_set: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Predict a child observation under a new condition without observing that child."""
+        z1_loc = self.encode_z(x1, x2_set, child_mask, c2_set)
         x1_loc, _ = self.index_decoder(z1_loc)
         z2_loc, _ = self.child_prior(z1_loc, c2_new)
         zp_zero = z1_loc.new_zeros(z1_loc.shape[0], self.z_private_dim)
         x2_loc, _ = self.child_decoder(z2_loc, z1_loc, c2_new, zp_zero)
         return x1_loc, x2_loc
 
-    def encode(self, x1, x2, c2, x2_set=None, child_mask=None):
-        """Return posterior means for z1 (global), z2 (child), z_private."""
-        z1_loc = self.encode_z(x1, x2_set, child_mask)
+    def encode(
+        self,
+        x1: torch.Tensor,
+        x2: torch.Tensor,
+        c2: torch.Tensor,
+        x2_set: torch.Tensor | None = None,
+        child_mask: torch.Tensor | None = None,
+        c2_set: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return posterior means for the global, shared-child, and private latents."""
+        z1_loc = self.encode_z(x1, x2_set, child_mask, c2_set)
         z2_loc, _ = self.child_encoder(x2, z1_loc, c2)
         zp_loc, _ = self.private_encoder(x2, c2)
         return z1_loc, z2_loc, zp_loc

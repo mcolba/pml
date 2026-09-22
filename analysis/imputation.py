@@ -1,11 +1,11 @@
 """Compare MCMC imputation methods across all VAE variants.
 
-Trains each model on a synthetic DGP, injects missingness, runs every
-imputation algorithm, and prints a summary table comparing MSE and
-acceptance rates against a naive (column-mean) baseline.
+Trains each model on a synthetic DGP, then imputes a held-out parent group.
+The column-mean baseline uses training groups only. Prints MSE and acceptance
+rates for exploratory comparison; pass/fail methodology checks live in tests.
 
 Usage:
-    python -m tests.integration.test_imputation
+    python -m analysis.imputation
 """
 
 from __future__ import annotations
@@ -23,13 +23,14 @@ from src.imputation import (
     hvae_mcmc_impute,
     hvae_mcmc_impute_approx,
     hvae_mcmc_impute_sequential,
+    hvae_mcmc_impute_sequential_full,
     hvae_ps_mcmc_impute,
     hvae_ps_mcmc_impute_sequential,
     vae_mcmc_impute,
 )
 from src.vae.cvae import CVAE
 from src.vae.hvae import HierarchicalVAE
-from src.vae.hvae_ps import HierarchicalPSVAE
+from src.vae._deprecated.hvae_ps import HierarchicalPSVAE
 from src.vae.utils.set_transformer import MeanPoolSetEncoder
 from src.vae.vae import VAE
 from tests.integration.data.dgp import (
@@ -46,12 +47,13 @@ N_OBS = 2000
 N_CHILDREN = 50
 MCMC_STEPS = 2000
 BURN_IN = 100
-SVI_STEPS = 2000
+SVI_STEPS = 4000
 HIDDEN = 64
 X1_DIM = 10
 X2_DIM = 10
 C_DIM = 1
 MISS_FRAC = 0.9
+TRAIN_FRACTION = 0.8
 SEED = 42
 
 torch.manual_seed(SEED)
@@ -63,7 +65,7 @@ np.random.seed(SEED)
 # ============================================================================
 
 
-def train_svi(model_fn, guide_fn, data_batches, lr=5e-3, steps=SVI_STEPS, patience=20):
+def train_svi(model_fn, guide_fn, data_batches, lr=1e-3, steps=SVI_STEPS, patience=50):
     optimizer = Adam({"lr": lr})
     svi = SVI(model_fn, guide_fn, optimizer, loss=Trace_ELBO())
     best_loss = float("inf")
@@ -164,6 +166,19 @@ def naive_baseline_mse(x_train, miss_idx, true_vals):
     return mse(col_means[miss_idx].numpy(), true_vals.numpy())
 
 
+def split_parent_groups(data):
+    """Keep every child of a parent in the same train or held-out partition."""
+    n_groups = data[0].shape[0]
+    if any(tensor.shape[0] != n_groups for tensor in data):
+        raise ValueError("All parent, child, and condition tensors must align")
+    n_train = int(n_groups * TRAIN_FRACTION)
+    if not 0 < n_train < n_groups:
+        raise ValueError("At least one train and one held-out group are required")
+    return tuple(tensor[:n_train] for tensor in data), tuple(
+        tensor[n_train:] for tensor in data
+    )
+
+
 def fmt_rates(rates: dict[str, float]) -> str:
     parts = []
     for k, v in rates.items():
@@ -199,8 +214,9 @@ def mh_label(use_mh: bool) -> str:
 
 
 def run_vae(data, dgp_label=""):
-    x1, x2, c = data  # x2: (N, K, x2_dim)
-    x2_flat = x2.reshape(-1, X2_DIM)
+    (_, x2_train, _), (_, x2_test, _) = split_parent_groups(data)
+    x2_flat = x2_train.reshape(-1, X2_DIM)
+    x2_test_flat = x2_test.reshape(-1, X2_DIM)
     print_header(f"VAE  (flat, unconditional)  [{dgp_label}]")
     pyro.clear_param_store()
 
@@ -208,7 +224,7 @@ def run_vae(data, dgp_label=""):
     print("  Training VAE ...")
     train_svi(vae.model, vae.guide, [(x2_flat,)])
 
-    x_nan, true_vals, miss_idx = inject_nan(x2_flat, MISS_FRAC)
+    x_nan, true_vals, miss_idx = inject_nan(x2_test_flat, MISS_FRAC)
     mse_base = naive_baseline_mse(x2_flat, miss_idx, true_vals)
     print(f"  Naive baseline MSE = {mse_base:.6f}")
 
@@ -252,9 +268,11 @@ def run_vae(data, dgp_label=""):
 
 
 def run_cvae(data, dgp_label=""):
-    x1, x2, c = data  # x2: (N, K, x2_dim), c: (N, K, c_dim)
-    x2_flat = x2.reshape(-1, X2_DIM)
-    c_flat = c.reshape(-1, C_DIM)
+    (_, x2_train, c_train), (_, x2_test, c_test) = split_parent_groups(data)
+    x2_flat = x2_train.reshape(-1, X2_DIM)
+    c_flat = c_train.reshape(-1, C_DIM)
+    x2_test_flat = x2_test.reshape(-1, X2_DIM)
+    c_test_flat = c_test.reshape(-1, C_DIM)
     print_header(f"CVAE  (conditional)  [{dgp_label}]")
     pyro.clear_param_store()
 
@@ -262,8 +280,8 @@ def run_cvae(data, dgp_label=""):
     print("  Training CVAE ...")
     train_svi(vae.model, vae.guide, [(x2_flat, c_flat)])
 
-    x_nan, true_vals, miss_idx = inject_nan(x2_flat, MISS_FRAC)
-    c_obs = c_flat[0]
+    x_nan, true_vals, miss_idx = inject_nan(x2_test_flat, MISS_FRAC)
+    c_obs = c_test_flat[0]
     mse_base = naive_baseline_mse(x2_flat, miss_idx, true_vals)
     print(f"  Naive baseline MSE = {mse_base:.6f}")
 
@@ -309,16 +327,16 @@ def run_cvae(data, dgp_label=""):
 
 
 def run_hvae(data, use_set_encoder=False, dgp_label=""):
-    x1, x2, c = data  # x2: (N, K, x2_dim), c: (N, K, c_dim)
-    tag = " + attn" if use_set_encoder else ""
+    (x1, x2, c), (x1_test, x2_test, c_test) = split_parent_groups(data)
+    tag = " + set(x2,c2)" if use_set_encoder else ""
     print_header(f"HVAE  (hierarchical, 2-latent{tag})  [{dgp_label}]")
     pyro.clear_param_store()
 
     n_children = x2.shape[1]
-    mask = torch.ones(N_OBS, n_children)
+    mask = torch.ones(x1.shape[0], n_children)
 
     set_encoder = (
-        MeanPoolSetEncoder(input_dim=X2_DIM, d_model=HIDDEN, output_dim=5)
+        MeanPoolSetEncoder(input_dim=X2_DIM + C_DIM, d_model=HIDDEN, output_dim=5)
         if use_set_encoder
         else None
     )
@@ -335,10 +353,19 @@ def run_hvae(data, use_set_encoder=False, dgp_label=""):
     train_svi(vae.model, vae.guide, [(x1, x2, c, mask)])
 
     x2_flat = x2.reshape(-1, X2_DIM)
-    x2_nan, true_vals, miss_idx = inject_nan(x2[:, 0, :], MISS_FRAC)
-    x1_obs, c_obs = x1[0], c[0, 0]
-    # Only pass siblings when the encoder was trained with the SetEncoder
-    x2_sibs = x2[0, 1:, :].unsqueeze(0) if use_set_encoder and n_children > 1 else None
+    x2_nan, true_vals, miss_idx = inject_nan(x2_test[:, 0, :], MISS_FRAC)
+    x1_obs, c_obs = x1_test[0], c_test[0, 0]
+    # Only pass sibling observations/conditions when the encoder uses the set summary.
+    x2_siblings = (
+        x2_test[0, 1:, :].unsqueeze(0)
+        if use_set_encoder and n_children > 1
+        else None
+    )
+    c2_siblings = (
+        c_test[0, 1:, :].unsqueeze(0)
+        if use_set_encoder and n_children > 1
+        else None
+    )
     mse_base = naive_baseline_mse(x2_flat, miss_idx, true_vals)
     print(f"  Naive baseline MSE = {mse_base:.6f}")
 
@@ -357,7 +384,8 @@ def run_hvae(data, use_set_encoder=False, dgp_label=""):
         c_obs,
         num_steps=MCMC_STEPS,
         burn_in=BURN_IN,
-        x2_siblings=x2_sibs,
+        x2_siblings=x2_siblings,
+        c2_siblings=c2_siblings,
         use_mh=True,
     )
     elapsed = time.time() - t0
@@ -374,7 +402,8 @@ def run_hvae(data, use_set_encoder=False, dgp_label=""):
         c_obs,
         num_steps=MCMC_STEPS,
         burn_in=BURN_IN,
-        x2_siblings=x2_sibs,
+        x2_siblings=x2_siblings,
+        c2_siblings=c2_siblings,
         use_mh=True,
     )
     elapsed = time.time() - t0
@@ -391,7 +420,8 @@ def run_hvae(data, use_set_encoder=False, dgp_label=""):
         c_obs,
         num_steps=MCMC_STEPS,
         burn_in=BURN_IN,
-        x2_siblings=x2_sibs,
+        x2_siblings=x2_siblings,
+        c2_siblings=c2_siblings,
         use_mh=True,
     )
     elapsed = time.time() - t0
@@ -408,7 +438,8 @@ def run_hvae(data, use_set_encoder=False, dgp_label=""):
         c_obs,
         num_steps=MCMC_STEPS,
         burn_in=BURN_IN,
-        x2_siblings=x2_sibs,
+        x2_siblings=x2_siblings,
+        c2_siblings=c2_siblings,
         use_mh=False,
     )
     elapsed = time.time() - t0
@@ -416,6 +447,49 @@ def run_hvae(data, use_set_encoder=False, dgp_label=""):
     rates = {"(z,u)": res[3]}
     print_result("hvae [no_mh]", mse_val, mse_base, rates, elapsed)
     results[f"{pfx} no_mh"] = (mse_val, rates)
+
+    if use_set_encoder:
+        # --- hvae_mcmc_impute_sequential_full: centered (use_noncentered=False) ---
+        t0 = time.time()
+        res = hvae_mcmc_impute_sequential_full(
+            vae,
+            x1_obs,
+            x2_nan,
+            c_obs,
+            num_steps=MCMC_STEPS,
+            burn_in=BURN_IN,
+            x2_siblings=x2_siblings,
+            c_siblings=c2_siblings,
+            use_mh=True,
+            use_noncentered=False,
+        )
+        elapsed = time.time() - t0
+        mse_val = mse(res[0][miss_idx.numpy()], true_vals.numpy())
+        rates = {"z": res[3], "u": res[4], "sib": res[5]}
+        print_result("hvae_seq_full [mh, centered]", mse_val, mse_base, rates, elapsed)
+        results[f"{pfx} seq mh exact"] = (mse_val, rates)
+
+        # --- hvae_mcmc_impute_sequential_full: non-centered (use_noncentered=True) ---
+        t0 = time.time()
+        res = hvae_mcmc_impute_sequential_full(
+            vae,
+            x1_obs,
+            x2_nan,
+            c_obs,
+            num_steps=MCMC_STEPS,
+            burn_in=BURN_IN,
+            x2_siblings=x2_siblings,
+            c_siblings=c2_siblings,
+            use_mh=True,
+            use_noncentered=True,
+        )
+        elapsed = time.time() - t0
+        mse_val = mse(res[0][miss_idx.numpy()], true_vals.numpy())
+        rates = {"z": res[3], "u": res[4], "sib": res[5]}
+        print_result(
+            "hvae_seq_full [mh, noncentered]", mse_val, mse_base, rates, elapsed
+        )
+        results[f"{pfx} seq mh exact non-cntr"] = (mse_val, rates)
 
     results[f"Naive ({pfx})"] = mse_base
     return results
@@ -427,16 +501,16 @@ def run_hvae(data, use_set_encoder=False, dgp_label=""):
 
 
 def run_ps_hvae(data, use_set_encoder=False, dgp_label=""):
-    x1, x2, c = data  # x2: (N, K, x2_dim), c: (N, K, c_dim)
-    tag = " + attn" if use_set_encoder else ""
+    (x1, x2, c), (x1_test, x2_test, c_test) = split_parent_groups(data)
+    tag = " + set(x2,c2)" if use_set_encoder else ""
     print_header(f"PS-HVAE  (private-shared, 2-latent{tag})  [{dgp_label}]")
     pyro.clear_param_store()
 
     n_children = x2.shape[1]
-    mask = torch.ones(N_OBS, n_children)
+    mask = torch.ones(x1.shape[0], n_children)
 
     set_encoder = (
-        MeanPoolSetEncoder(input_dim=X2_DIM, d_model=HIDDEN, output_dim=5)
+        MeanPoolSetEncoder(input_dim=X2_DIM + C_DIM, d_model=HIDDEN, output_dim=5)
         if use_set_encoder
         else None
     )
@@ -454,10 +528,19 @@ def run_ps_hvae(data, use_set_encoder=False, dgp_label=""):
     train_svi(vae.model, vae.guide, [(x1, x2, c, mask)])
 
     x2_flat = x2.reshape(-1, X2_DIM)
-    x2_nan, true_vals, miss_idx = inject_nan(x2[:, 0, :], MISS_FRAC)
-    x1_obs, c_obs = x1[0], c[0, 0]
-    # Only pass siblings when the encoder was trained with the SetEncoder
-    x2_sibs = x2[0, 1:, :].unsqueeze(0) if use_set_encoder and n_children > 1 else None
+    x2_nan, true_vals, miss_idx = inject_nan(x2_test[:, 0, :], MISS_FRAC)
+    x1_obs, c_obs = x1_test[0], c_test[0, 0]
+    # Only pass sibling observations/conditions when the encoder uses the set summary.
+    x2_siblings = (
+        x2_test[0, 1:, :].unsqueeze(0)
+        if use_set_encoder and n_children > 1
+        else None
+    )
+    c2_siblings = (
+        c_test[0, 1:, :].unsqueeze(0)
+        if use_set_encoder and n_children > 1
+        else None
+    )
     mse_base = naive_baseline_mse(x2_flat, miss_idx, true_vals)
     print(f"  Naive baseline MSE = {mse_base:.6f}")
 
@@ -476,7 +559,8 @@ def run_ps_hvae(data, use_set_encoder=False, dgp_label=""):
         c_obs,
         num_steps=MCMC_STEPS,
         burn_in=BURN_IN,
-        x2_siblings=x2_sibs,
+        x2_siblings=x2_siblings,
+        c2_siblings=c2_siblings,
         use_mh=True,
     )
     elapsed = time.time() - t0
@@ -493,7 +577,8 @@ def run_ps_hvae(data, use_set_encoder=False, dgp_label=""):
         c_obs,
         num_steps=MCMC_STEPS,
         burn_in=BURN_IN,
-        x2_siblings=x2_sibs,
+        x2_siblings=x2_siblings,
+        c2_siblings=c2_siblings,
         use_mh=True,
     )
     elapsed = time.time() - t0
@@ -510,7 +595,8 @@ def run_ps_hvae(data, use_set_encoder=False, dgp_label=""):
         c_obs,
         num_steps=MCMC_STEPS,
         burn_in=BURN_IN,
-        x2_siblings=x2_sibs,
+        x2_siblings=x2_siblings,
+        c2_siblings=c2_siblings,
         use_mh=False,
     )
     elapsed = time.time() - t0
@@ -527,7 +613,8 @@ def run_ps_hvae(data, use_set_encoder=False, dgp_label=""):
         c_obs,
         num_steps=MCMC_STEPS,
         burn_in=BURN_IN,
-        x2_siblings=x2_sibs,
+        x2_siblings=x2_siblings,
+        c2_siblings=c2_siblings,
         use_mh=False,
     )
     elapsed = time.time() - t0

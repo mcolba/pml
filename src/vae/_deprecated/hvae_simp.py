@@ -22,7 +22,7 @@ torch.manual_seed(42)
 class ConditionalPrior(nn.Module):
     """p(z | x1, c) — learned conditional prior."""
 
-    def __init__(self, x1_dim, c_dim, z_dim, hidden_dim):
+    def __init__(self, x1_dim, c_dim, z_dim, hidden_dim) -> None:
         super().__init__()
         in_dim = x1_dim + c_dim
         self.fc1 = nn.Linear(in_dim, hidden_dim)
@@ -30,7 +30,10 @@ class ConditionalPrior(nn.Module):
         self.fc_scale = nn.Linear(hidden_dim, z_dim)
         self.softplus = nn.Softplus()
 
-    def forward(self, x1, c):
+    def forward(
+        self, x1: torch.Tensor, c: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the conditional prior location and scale for a batch."""
         x1 = x1.reshape(-1, x1.shape[-1])
         c = c.reshape(-1, c.shape[-1])
         inp = torch.cat([x1, c], dim=-1)
@@ -41,9 +44,9 @@ class ConditionalPrior(nn.Module):
 
 
 class Encoder(nn.Module):
-    """q(z | x2, x1, c)"""
+    """q(z | x2, x1, c) — encode child observations with observed context."""
 
-    def __init__(self, x2_dim, x1_dim, c_dim, z_dim, hidden_dim):
+    def __init__(self, x2_dim, x1_dim, c_dim, z_dim, hidden_dim) -> None:
         super().__init__()
         in_dim = x2_dim + x1_dim + c_dim
         self.fc1 = nn.Linear(in_dim, hidden_dim)
@@ -52,7 +55,10 @@ class Encoder(nn.Module):
         self.softplus = nn.Softplus()
         self.x2_dim = x2_dim
 
-    def forward(self, x2, x1, c):
+    def forward(
+        self, x2: torch.Tensor, x1: torch.Tensor, c: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the posterior location and scale for a batch."""
         x2 = x2.reshape(-1, self.x2_dim)
         x1 = x1.reshape(-1, x1.shape[-1])
         c = c.reshape(-1, c.shape[-1])
@@ -64,9 +70,9 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    """p(x2 | z, x1, c)"""
+    """p(x2 | z, x1, c) — decode child observations from latent and context."""
 
-    def __init__(self, x2_dim, z_dim, x1_dim, c_dim, hidden_dim):
+    def __init__(self, x2_dim, z_dim, x1_dim, c_dim, hidden_dim) -> None:
         super().__init__()
         in_dim = z_dim + x1_dim + c_dim
         self.fc1 = nn.Linear(in_dim, hidden_dim)
@@ -74,7 +80,10 @@ class Decoder(nn.Module):
         self.softplus = nn.Softplus()
         self.log_x_scale = nn.Parameter(torch.zeros(x2_dim))
 
-    def forward(self, z, x1, c):
+    def forward(
+        self, z: torch.Tensor, x1: torch.Tensor, c: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the decoded observation mean and log scale."""
         inp = torch.cat([z, x1, c], dim=-1)
         hidden = self.softplus(self.fc1(inp))
         x_loc = self.fc_loc(hidden)
@@ -116,24 +125,27 @@ class HierarchicalVAE(nn.Module):
         z_dim: int = 2,
         hidden_dim: int = 50,
         use_cuda: bool = False,
-    ):
+    ) -> None:
         super().__init__()
-        self.x1_dim = x1_dim
-        self.x2_dim = x2_dim
-        self.c_dim = c_dim
-        self.z_dim = z_dim
+        self.x1_dim: int = x1_dim
+        self.x2_dim: int = x2_dim
+        self.c_dim: int = c_dim
+        self.z_dim: int = z_dim
 
-        self.encoder = Encoder(x2_dim, x1_dim, c_dim, z_dim, hidden_dim)
-        self.decoder = Decoder(x2_dim, z_dim, x1_dim, c_dim, hidden_dim)
-        self.prior_z = ConditionalPrior(x1_dim, c_dim, z_dim, hidden_dim)
+        self.encoder: Encoder = Encoder(x2_dim, x1_dim, c_dim, z_dim, hidden_dim)
+        self.decoder: Decoder = Decoder(x2_dim, z_dim, x1_dim, c_dim, hidden_dim)
+        self.prior_z: ConditionalPrior = ConditionalPrior(x1_dim, c_dim, z_dim, hidden_dim)
 
-        self.use_cuda = use_cuda
+        self.use_cuda: bool = use_cuda
         if use_cuda:
             self.cuda()
 
     # ---- Pyro model / guide ------------------------------------------------
 
-    def model(self, x1, x2, c2, annealing_factor=1.0):
+    def model(
+        self, x1: torch.Tensor, x2: torch.Tensor, c2: torch.Tensor, annealing_factor: float = 1.0
+    ) -> torch.Tensor:
+        """Define the conditional hierarchical generative model for a batch."""
         pyro.module("decoder", self.decoder)
         pyro.module("prior_z", self.prior_z)
 
@@ -157,7 +169,10 @@ class HierarchicalVAE(nn.Module):
 
         return x2_loc
 
-    def guide(self, x1, x2, c2, annealing_factor=1.0):
+    def guide(
+        self, x1: torch.Tensor, x2: torch.Tensor, c2: torch.Tensor, annealing_factor: float = 1.0
+    ) -> None:
+        """Define the conditional hierarchical variational posterior for a batch."""
         pyro.module("encoder", self.encoder)
 
         with pyro.plate("data", x1.shape[0]):
@@ -167,55 +182,46 @@ class HierarchicalVAE(nn.Module):
 
     # ---- Inference helpers --------------------------------------------------
 
-    def reconstruct(self, x1, x2, c2):
-        """Stochastic reconstruction of x2 (x1 is returned unchanged)."""
+    def reconstruct(
+        self, x1: torch.Tensor, x2: torch.Tensor, c2: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return a stochastic reconstruction of x1 and one child observation."""
         z_loc, z_scale = self.encoder(x2, x1, c2)
         z = dist.Normal(z_loc, z_scale).sample()
         x2_loc, _ = self.decoder(z, x1, c2)
         return x1, x2_loc
 
-    def reconstruct_map(self, x1, x2, c2):
-        """MAP (mean) reconstruction — no sampling noise. x1 returned unchanged."""
+    def reconstruct_map(
+        self, x1: torch.Tensor, x2: torch.Tensor, c2: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the deterministic reconstruction of x1 and one child observation."""
         z_loc, _ = self.encoder(x2, x1, c2)
         x2_loc, _ = self.decoder(z_loc, x1, c2)
         return x1, x2_loc
 
-    def counterfactual_prediction(self, x1, c2_new):
-        """
-        Predict x2 under a new condition without observing x2.
-
-        Uses the conditional prior p(z | x1, c2_new) mean and decodes.
-        x1 is returned unchanged.
-        """
+    def counterfactual_prediction(
+        self, x1: torch.Tensor, c2_new: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Predict a child observation under a new condition without observing that child."""
         z_loc, _ = self.prior_z(x1, c2_new)
         x2_loc, _ = self.decoder(z_loc, x1, c2_new)
         return x1, x2_loc
 
-    def predict_x2(self, x1, c2):
-        """
-        MAP prediction of x2 from x1 and condition c2 (no x2 observed).
-
-        Uses the conditional prior mean for z, so the output is
-        fully deterministic.
-        """
+    def predict_x2(self, x1: torch.Tensor, c2: torch.Tensor) -> torch.Tensor:
+        """Return the MAP child prediction from x1 and conditioning."""
         z_loc, _ = self.prior_z(x1, c2)
         x2_loc, _ = self.decoder(z_loc, x1, c2)
         return x2_loc
 
-    def encode(self, x1, x2, c2):
-        """Return posterior mean for the latent z."""
+    def encode(self, x1: torch.Tensor, x2: torch.Tensor, c2: torch.Tensor) -> torch.Tensor:
+        """Return the posterior mean of the latent for a batch."""
         z_loc, _ = self.encoder(x2, x1, c2)
         return z_loc
 
-    def sample_x2(self, x1, c2, n_samples=1):
-        """
-        Generate x2 samples given observed x1 and condition c2.
-
-        Supports batched inputs: x1 of shape (B, x1_dim) and c2 of
-        shape (B, c2_dim).  Returns shape (B, n_samples, x2_dim).
-
-        For a single sample (no batch dim), returns (n_samples, x2_dim).
-        """
+    def sample_x2(
+        self, x1: torch.Tensor, c2: torch.Tensor, n_samples: int = 1
+    ) -> torch.Tensor:
+        """Sample child observations conditioned on x1 and c2."""
         squeeze = x1.dim() == 1
         if squeeze:
             x1 = x1.unsqueeze(0)
@@ -255,7 +261,8 @@ def train(
     test_frequency: int = 5,
     learning_rate: float = 1e-3,
     cuda: bool = False,
-):
+) -> HierarchicalVAE:
+    """Train the simplified hierarchical VAE on loaders that yield `(x1, _, x2, c2)` batches."""
     pyro.clear_param_store()
 
     train_loader, test_loader = data_loaders
@@ -277,8 +284,8 @@ def train(
     test_elbo = {}
 
     for epoch in range(num_epochs):
-        progress = min((epoch + 1) / num_epochs, 1.0)
-        annealing_factor = (1 - progress) * annealing_start + progress * beta
+        progress: float = min((epoch + 1) / num_epochs, 1.0)
+        annealing_factor: float = (1 - progress) * annealing_start + progress * beta
 
         epoch_loss = 0.0
         for batch in train_loader:
@@ -287,7 +294,7 @@ def train(
                 x1, x2, c2 = x1.cuda(), x2.cuda(), c2.cuda()
             epoch_loss += svi.step(x1, x2, c2, annealing_factor)
 
-        normalizer_train = len(train_loader.dataset)
+        normalizer_train: int = len(train_loader.dataset)
         total_epoch_loss_train = epoch_loss / normalizer_train
         train_elbo[epoch] = total_epoch_loss_train
         print(
@@ -303,7 +310,7 @@ def train(
                     x1, x2, c2 = x1.cuda(), x2.cuda(), c2.cuda()
                 test_loss += svi.evaluate_loss(x1, x2, c2, annealing_factor)
 
-            normalizer_test = len(test_loader.dataset)
+            normalizer_test: int = len(test_loader.dataset)
             total_epoch_loss_test = test_loss / normalizer_test
             test_elbo[epoch] = total_epoch_loss_test
             print(
