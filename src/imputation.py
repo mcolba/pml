@@ -1,13 +1,14 @@
 """Shared MCMC imputation routines for VAE, CVAE, and Hierarchical VAE.
 
 All samplers implement the Metropolis-within-Gibbs scheme of Mattei &
-Frellsen (2019, ICML — "MIWAE").  The HVAE variant extends the flat
+Frellsen (2018, NeurIPS). The HVAE variant extends the flat
 algorithm to a two-level hierarchy with a **joint** MH accept/reject
 step for the parent–child latent pair ``(z, u)``.
 
 References
 ----------
-- Mattei & Frellsen (2019), "Missing Data Imputation …", ICML.
+- Mattei & Frellsen (2018), "Leveraging the Exact Likelihood of Deep Latent
+  Variable Models", NeurIPS, Section 3.2.
 - Roberts, Gelman & Gilks (1997), "Weak Convergence …", Ann. Appl. Probab.
 - Gilks, Richardson & Spiegelhalter (1996), "MCMC in Practice", Chapman & Hall.
 """
@@ -33,6 +34,15 @@ def _log_prior_z(z):
     return _log_normal(z, torch.zeros_like(z), torch.ones_like(z))
 
 
+def _cvae_prior_params(vae, c, z_template):
+    """Return the CVAE's conditional Normal prior parameters."""
+    if hasattr(vae, "prior_network"):
+        return vae.prior_network(c)
+    if hasattr(vae, "prior_scale"):
+        return torch.zeros_like(z_template), vae.prior_scale(c)
+    return torch.zeros_like(z_template), torch.ones_like(z_template)
+
+
 # ============================================================================
 # Flat-VAE imputation  (single latent z, unconditional decoder)
 # ============================================================================
@@ -44,6 +54,8 @@ def vae_mcmc_impute(vae, x_with_nan, *, num_steps=1000, burn_in=200, use_mh=True
     Parameters
     ----------
     vae : VAE with ``.encoder(x) -> (loc, scale)`` and ``.decoder(z) -> (loc, log_scale)``.
+          Its ``._latent_prior`` is used when available; otherwise the prior is
+          assumed to be standard Normal.
     x_with_nan : Tensor (x_dim,)  — observed entries; NaN at missing positions.
     num_steps  : int               — total MCMC iterations (including burn-in).
     burn_in    : int               — iterations to discard before collecting.
@@ -57,12 +69,24 @@ def vae_mcmc_impute(vae, x_with_nan, *, num_steps=1000, burn_in=200, use_mh=True
     """
     vae.eval()
     miss_mask = torch.isnan(x_with_nan)
+    all_missing = bool(miss_mask.all())
     x_curr = x_with_nan.clone()
+    z_template = x_with_nan.new_zeros((1, vae.z_dim))
+    with torch.no_grad():
+        latent_prior = (
+            vae._latent_prior(z_template, torch.ones_like(z_template))
+            if (use_mh or all_missing) and hasattr(vae, "_latent_prior")
+            else None
+        )
 
     # ---- Initialisation -----------------------------------------------------
-    if miss_mask.all():
+    if all_missing:
         with torch.no_grad():
-            z_init = torch.randn(1, vae.z_dim)
+            z_init = (
+                latent_prior.sample()
+                if latent_prior is not None
+                else torch.randn_like(z_template)
+            )
             x_loc_init, _ = vae.decoder(z_init)
             x_curr = x_loc_init.squeeze(0)
     else:
@@ -81,6 +105,9 @@ def vae_mcmc_impute(vae, x_with_nan, *, num_steps=1000, burn_in=200, use_mh=True
         loc, log_scale = vae.decoder(z)
         return _log_normal(x_b, loc, torch.exp(log_scale))
 
+    def _log_prior(z):
+        return latent_prior.log_prob(z) if latent_prior is not None else _log_prior_z(z)
+
     # ---- MCMC loop ----------------------------------------------------------
     miss_samples: list[np.ndarray] = []
     n_accept = 0
@@ -95,10 +122,10 @@ def vae_mcmc_impute(vae, x_with_nan, *, num_steps=1000, burn_in=200, use_mh=True
 
             if use_mh:
                 log_alpha = (
-                    _log_prior_z(z_prop)
+                    _log_prior(z_prop)
                     + _log_lik(x_b, z_prop)
                     + _log_q(z_curr, x_b)
-                    - _log_prior_z(z_curr)
+                    - _log_prior(z_curr)
                     - _log_lik(x_b, z_curr)
                     - _log_q(z_prop, x_b)
                 )
@@ -135,6 +162,8 @@ def cvae_mcmc_impute(vae, x_with_nan, c, *, num_steps=1000, burn_in=200, use_mh=
     Parameters
     ----------
     vae : CVAE with ``.encoder(x, c)``, ``.decoder(z, c)``, and ``.z_dim``.
+          The prior comes from ``prior_network(c)`` or ``prior_scale(c)`` when
+          present; otherwise it is assumed to be standard Normal.
     x_with_nan : Tensor (x_dim,)
     c           : Tensor (c_dim,)  — conditioning vector.
     num_steps, burn_in : int
@@ -146,13 +175,18 @@ def cvae_mcmc_impute(vae, x_with_nan, c, *, num_steps=1000, burn_in=200, use_mh=
     """
     vae.eval()
     miss_mask = torch.isnan(x_with_nan)
+    all_missing = bool(miss_mask.all())
     x_curr = x_with_nan.clone()
     c_b = c.unsqueeze(0)
+    if use_mh or all_missing:
+        z_template = x_with_nan.new_zeros((1, vae.z_dim))
+        with torch.no_grad():
+            prior_loc, prior_scale = _cvae_prior_params(vae, c_b, z_template)
 
     # ---- Initialisation -----------------------------------------------------
-    if miss_mask.all():
+    if all_missing:
         with torch.no_grad():
-            z_init = torch.randn(1, vae.z_dim)
+            z_init = Normal(prior_loc, prior_scale).sample()
             x_loc_init, _ = vae.decoder(z_init, c_b)
             x_curr = x_loc_init.squeeze(0)
     else:
@@ -171,6 +205,9 @@ def cvae_mcmc_impute(vae, x_with_nan, c, *, num_steps=1000, burn_in=200, use_mh=
         loc, log_scale = vae.decoder(z, c_b)
         return _log_normal(x_b, loc, torch.exp(log_scale))
 
+    def _log_prior(z):
+        return _log_normal(z, prior_loc, prior_scale)
+
     # ---- MCMC loop ----------------------------------------------------------
     miss_samples: list[np.ndarray] = []
     n_accept = 0
@@ -184,10 +221,10 @@ def cvae_mcmc_impute(vae, x_with_nan, c, *, num_steps=1000, burn_in=200, use_mh=
 
             if use_mh:
                 log_alpha = (
-                    _log_prior_z(z_prop)
+                    _log_prior(z_prop)
                     + _log_lik(x_b, z_prop)
                     + _log_q(z_curr, x_b)
-                    - _log_prior_z(z_curr)
+                    - _log_prior(z_curr)
                     - _log_lik(x_b, z_curr)
                     - _log_q(z_prop, x_b)
                 )
@@ -250,8 +287,15 @@ def _get_hvae_methods(vae):
     )
 
 
-def _z1_enc_input(z1_input, x1_b, x2_b=None, x2_siblings=None):
-    """Build encoder input for z1, optionally enriched with an x2 summary.
+def _z1_enc_input(
+    z1_input,
+    x1_b,
+    x2_b=None,
+    x2_siblings=None,
+    c2_b=None,
+    c2_siblings=None,
+):
+    """Build encoder input for z1, optionally enriched with an ``(x2, c2)`` summary.
 
     When ``z1_input`` is ``None`` (legacy branch) or when
     ``z1_input.uses_summary`` is ``False``, returns *x1_b* unchanged.
@@ -262,27 +306,51 @@ def _z1_enc_input(z1_input, x1_b, x2_b=None, x2_siblings=None):
     x1_b     : Tensor (1, x1_dim)
     x2_b     : Tensor (1, x2_dim) | None — current x2 (may contain imputed values).
     x2_siblings : Tensor (1, K, x2_dim) | None — fully-observed sibling x2s.
+    c2_b     : Tensor (1, c2_dim) | None — target condition paired with ``x2_b``.
+    c2_siblings : Tensor (1, K, c2_dim) | None — sibling conditions paired with
+        ``x2_siblings``.
         When x2_b is provided, it is prepended to the sibling set so the
         SetEncoder sees the full child set at the same cardinality as training.
         When only x2_siblings is provided (x2_b is None), siblings alone are used.
     """
     if z1_input is None:
         return x1_b
+    if getattr(z1_input, "uses_summary", None) is False:
+        return z1_input(x1_b)
     if x2_b is not None:
         target = x2_b.unsqueeze(1)  # (1, 1, x2_dim)
+        target_c2 = c2_b.unsqueeze(1) if c2_b is not None else None
         if x2_siblings is not None:
             x2_set = torch.cat([target, x2_siblings], dim=1)  # (1, 1+K, x2_dim)
+            c2_set = (
+                torch.cat([target_c2, c2_siblings], dim=1)
+                if target_c2 is not None and c2_siblings is not None
+                else None
+            )
         else:
             x2_set = target  # (1, 1, x2_dim)
+            c2_set = target_c2
         K = x2_set.shape[1]
         child_mask = torch.ones(1, K, dtype=torch.bool, device=x1_b.device)
-        return z1_input(x1_b, x2_set, child_mask)
+        return z1_input(x1_b, x2_set, child_mask, c2_set=c2_set)
     elif x2_siblings is not None:
-        # Warm-start case: use siblings only (no target x2 yet)
         K = x2_siblings.shape[1]
         child_mask = torch.ones(1, K, dtype=torch.bool, device=x1_b.device)
-        return z1_input(x1_b, x2_siblings, child_mask)
+        return z1_input(x1_b, x2_siblings, child_mask, c2_set=c2_siblings)
     return z1_input(x1_b)
+
+
+def _validate_full_posterior_inputs(vae, x2_siblings, c2_siblings):
+    """Ensure full-posterior z1 proposals receive matched sibling observations."""
+    if getattr(vae, "use_full_posterior", False) and (
+        x2_siblings is None or c2_siblings is None
+    ):
+        raise ValueError(
+            "Model was trained with use_full_posterior=True but sibling x2/c2 "
+            "inputs were not both provided. Pass the observed sibling x2s and "
+            "their c2 values so the parent encoder receives matched (x2, c2) "
+            "pairs."
+        )
 
 
 def hvae_mcmc_impute(
@@ -294,6 +362,7 @@ def hvae_mcmc_impute(
     num_steps=5000,
     burn_in=500,
     x2_siblings=None,
+    c2_siblings=None,
     use_mh=True,
 ):
     """Impute missing entries in x2 via a hierarchical MH-within-Gibbs sampler.
@@ -304,9 +373,9 @@ def hvae_mcmc_impute(
     followed by an exact Gibbs draw for the missing data entries.
 
     When the model was trained with ``use_full_posterior=True`` the global
-    encoder ``q(z | x1, {x2})`` receives an attention-based summary of the
-    child observations via ``vae.z1_input``.  The summary is recomputed at
-    every MCMC step using the current (partially imputed) x2.
+    encoder ``q(z | x1, {x2, c2})`` receives a set summary of paired child
+    observations via ``vae.z1_input``. The summary is recomputed at every MCMC
+    step using the current (partially imputed) x2 and the corresponding c2.
 
     Algorithm
     =========
@@ -320,15 +389,15 @@ def hvae_mcmc_impute(
         We propose ``(z*, u*)`` jointly via an ancestral draw through the
         inference network:
 
-            z*  ~ q(z  | x1, {x2_curr})    — parent encoder (set-enriched)
+            z*  ~ q(z  | x1, {x2_curr, c2}) — parent encoder (set-enriched)
             u*  ~ q(u  | x2_curr, z*, c)    — child encoder, conditioned on z*
 
         The joint acceptance ratio is
 
-            α = [p(z*) p(x1|z*) p(u*|z*,c) p(x2|u*,z*,c)]
-              × [q(z_old|x1,{x2}) q(u_old|x2,z_old,c)]
+                        α = [p(z*) p(x1|z*) p(u*|z*,c) p(x2|u*,z*,c)]
+                            × [q(z_old|x1,{x2,c2}) q(u_old|x2,z_old,c)]
               ÷ [p(z)  p(x1|z)  p(u|z,c)  p(x2|u,z,c)]
-              ÷ [q(z*|x1,{x2}) q(u*|x2,z*,c)]
+                            ÷ [q(z*|x1,{x2,c2}) q(u*|x2,z*,c)]
 
     **Gibbs step for x2_miss**
 
@@ -345,6 +414,8 @@ def hvae_mcmc_impute(
     c            : Tensor (c_dim,)   — conditioning vector.
     num_steps    : int               — total MCMC iterations (including burn-in).
     burn_in      : int               — iterations to discard before collecting.
+    x2_siblings  : Tensor (1, K, x2_dim), optional
+    c2_siblings  : Tensor (1, K, c2_dim), optional
     use_mh       : bool              — if False, always accept latent proposals.
 
     Returns
@@ -357,12 +428,7 @@ def hvae_mcmc_impute(
     enc_z, dec_z, enc_u, dec_u, prior_u, _, _, z1_input = _get_hvae_methods(vae)
     vae.eval()
 
-    if getattr(vae, "use_full_posterior", False) and x2_siblings is None:
-        raise ValueError(
-            "Model was trained with use_full_posterior=True but x2_siblings "
-            "was not provided. Pass the observed sibling x2s so the "
-            "SetEncoder receives the same input structure as during training."
-        )
+    _validate_full_posterior_inputs(vae, x2_siblings, c2_siblings)
 
     miss_mask = torch.isnan(x2_with_nan)
     x1_b = x1.unsqueeze(0)
@@ -374,7 +440,12 @@ def hvae_mcmc_impute(
     # Use siblings for summary if available to match proposal distribution.
     # ------------------------------------------------------------------
     with torch.no_grad():
-        enc_input_init = _z1_enc_input(z1_input, x1_b, x2_siblings=x2_siblings)
+        enc_input_init = _z1_enc_input(
+            z1_input,
+            x1_b,
+            x2_siblings=x2_siblings,
+            c2_siblings=c2_siblings,
+        )
         z_loc_init, z_scale_init = enc_z(enc_input_init)
         z_curr = Normal(z_loc_init, z_scale_init).sample()
 
@@ -400,7 +471,14 @@ def hvae_mcmc_impute(
         return _log_normal(x1_b, loc, torch.exp(log_scale))
 
     def _log_q_z(z, x2_b):
-        enc_input = _z1_enc_input(z1_input, x1_b, x2_b, x2_siblings=x2_siblings)
+        enc_input = _z1_enc_input(
+            z1_input,
+            x1_b,
+            x2_b,
+            x2_siblings=x2_siblings,
+            c2_b=c_b,
+            c2_siblings=c2_siblings,
+        )
         loc, scale = enc_z(enc_input)
         return _log_normal(z, loc, scale)
 
@@ -430,18 +508,25 @@ def hvae_mcmc_impute(
             # ==============================================================
             # Joint MH step for (z, u)
             # ==============================================================
-            # Ancestral proposal:  z* ~ q(z|x1,{x2}),  u* ~ q(u|x2, z*, c)
-            enc_input = _z1_enc_input(z1_input, x1_b, x2_b, x2_siblings=x2_siblings)
+            # Ancestral proposal: z* ~ q(z|x1,{x2,c2}), u* ~ q(u|x2, z*, c)
+            enc_input = _z1_enc_input(
+                z1_input,
+                x1_b,
+                x2_b,
+                x2_siblings=x2_siblings,
+                c2_b=c_b,
+                c2_siblings=c2_siblings,
+            )
             z_loc_p, z_scale_p = enc_z(enc_input)
             z_prop = Normal(z_loc_p, z_scale_p).sample()
 
             u_loc_p, u_scale_p = enc_u(x2_b, z_prop, c_b)
             u_prop = Normal(u_loc_p, u_scale_p).sample()
 
-            # Forward proposal: log q(z*, u* | x1, {x2}, c)
+            # Forward proposal: log q(z*, u* | x1, {x2, c2}, c)
             log_q_fwd = _log_q_z(z_prop, x2_b) + _log_q_u(u_prop, x2_b, z_prop)
 
-            # Reverse proposal: log q(z_old, u_old | x1, {x2}, c)
+            # Reverse proposal: log q(z_old, u_old | x1, {x2, c2}, c)
             log_q_rev = _log_q_z(z_curr, x2_b) + _log_q_u(u_curr, x2_b, z_curr)
 
             # Target (unnormalised) at proposed (z*, u*)
@@ -508,6 +593,7 @@ def hvae_mcmc_impute_sequential(
     num_steps=5000,
     burn_in=500,
     x2_siblings=None,
+    c2_siblings=None,
     use_mh=True,
 ):
     """Impute missing entries in x2 with **sequential** block-MH for z then u.
@@ -517,10 +603,10 @@ def hvae_mcmc_impute_sequential(
 
     1. **MH for z** (u held fixed):
 
-       Propose ``z* ~ q(z | x1, {x2})``.  Accept with ratio
+       Propose ``z* ~ q(z | x1, {x2, c2})``.  Accept with ratio
 
-           α_z = p(z*) p(x1|z*) p(u|z*,c) p(x2|u,z*,c)  ·  q(z|x1,{x2})
-               ÷ p(z)  p(x1|z)  p(u|z,c)  p(x2|u,z,c)   ÷  q(z*|x1,{x2})
+           α_z = p(z*) p(x1|z*) p(u|z*,c) p(x2|u,z*,c)  ·  q(z|x1,{x2,c2})
+               ÷ p(z)  p(x1|z)  p(u|z,c)  p(x2|u,z,c)   ÷  q(z*|x1,{x2,c2})
 
     2. **MH for u** (z held fixed):
 
@@ -539,6 +625,8 @@ def hvae_mcmc_impute_sequential(
     c            : Tensor (c_dim,)
     num_steps    : int
     burn_in      : int
+    x2_siblings  : Tensor (1, K, x2_dim), optional
+    c2_siblings  : Tensor (1, K, c2_dim), optional
     use_mh       : bool
 
     Returns
@@ -552,12 +640,7 @@ def hvae_mcmc_impute_sequential(
     enc_z, dec_z, enc_u, dec_u, prior_u, _, _, z1_input = _get_hvae_methods(vae)
     vae.eval()
 
-    if getattr(vae, "use_full_posterior", False) and x2_siblings is None:
-        raise ValueError(
-            "Model was trained with use_full_posterior=True but x2_siblings "
-            "was not provided. Pass the observed sibling x2s so the "
-            "SetEncoder receives the same input structure as during training."
-        )
+    _validate_full_posterior_inputs(vae, x2_siblings, c2_siblings)
 
     miss_mask = torch.isnan(x2_with_nan)
     x1_b = x1.unsqueeze(0)
@@ -567,7 +650,12 @@ def hvae_mcmc_impute_sequential(
     # Warm-start — use siblings for summary if available
     # ------------------------------------------------------------------
     with torch.no_grad():
-        enc_input_init = _z1_enc_input(z1_input, x1_b, x2_siblings=x2_siblings)
+        enc_input_init = _z1_enc_input(
+            z1_input,
+            x1_b,
+            x2_siblings=x2_siblings,
+            c2_siblings=c2_siblings,
+        )
         z_loc_init, z_scale_init = enc_z(enc_input_init)
         z_curr = Normal(z_loc_init, z_scale_init).sample()
 
@@ -592,7 +680,14 @@ def hvae_mcmc_impute_sequential(
         return _log_normal(x1_b, loc, torch.exp(log_scale))
 
     def _log_q_z(z, x2_b):
-        enc_input = _z1_enc_input(z1_input, x1_b, x2_b, x2_siblings=x2_siblings)
+        enc_input = _z1_enc_input(
+            z1_input,
+            x1_b,
+            x2_b,
+            x2_siblings=x2_siblings,
+            c2_b=c_b,
+            c2_siblings=c2_siblings,
+        )
         loc, scale = enc_z(enc_input)
         return _log_normal(z, loc, scale)
 
@@ -623,7 +718,14 @@ def hvae_mcmc_impute_sequential(
             # ==============================================================
             # Block 1 — MH for z  (u held fixed)
             # ==============================================================
-            enc_input = _z1_enc_input(z1_input, x1_b, x2_b, x2_siblings=x2_siblings)
+            enc_input = _z1_enc_input(
+                z1_input,
+                x1_b,
+                x2_b,
+                x2_siblings=x2_siblings,
+                c2_b=c_b,
+                c2_siblings=c2_siblings,
+            )
             z_loc_p, z_scale_p = enc_z(enc_input)
             z_prop = Normal(z_loc_p, z_scale_p).sample()
 
@@ -699,6 +801,390 @@ def hvae_mcmc_impute_sequential(
     return x2_imputed, miss_samples_arr, full_samples_arr, accept_rate_z, accept_rate_u
 
 
+def hvae_mcmc_impute_sequential_full(
+    vae,
+    x1,
+    x2_with_nan,
+    c,
+    *,
+    num_steps=5000,
+    burn_in=500,
+    x2_siblings=None,
+    c_siblings=None,
+    use_mh=True,
+    use_noncentered=False,
+):
+    """Impute one child with sequential MH using observed siblings in q(z).
+
+    This function is intentionally close to :func:`hvae_mcmc_impute_sequential`,
+    but the parent proposal can use the current target child plus an observed
+    sibling set:
+
+        z* ~ q(z | x1, {x2_target_curr, x2_siblings}).
+
+    If ``x2_siblings`` is provided, siblings are always part of the MH target.
+    The sampler introduces one latent ``u_j`` per observed sibling and updates
+    every sibling latent once per MCMC iteration.  The target is
+
+        p(z) p(x1 | z)
+        p(u0 | z, c0) p(x2_target | u0, z, c0)
+        prod_j p(uj | z, cj) p(x2_sibling_j | uj, z, cj).
+
+    Non-centred option
+    ------------------
+    When ``use_noncentered=True``, each child latent is represented as
+
+        u = mu_u(z, c) + scale_u(z, c) * eps,     eps ~ N(0, I).
+
+    The z-step keeps eps fixed and recomputes u under the proposed z.  This
+    removes the centred ``p(u | z, c)`` term from the z acceptance ratio.
+    """
+    if burn_in >= num_steps:
+        raise ValueError("burn_in must be smaller than num_steps.")
+
+    enc_z, dec_z, enc_u, dec_u, prior_u, _, _, z1_input = _get_hvae_methods(vae)
+    vae.eval()
+
+    if getattr(vae, "use_full_posterior", False) and x2_siblings is None:
+        raise ValueError(
+            "Model was trained with use_full_posterior=True but x2_siblings "
+            "was not provided. Pass the observed sibling x2s so the "
+            "SetEncoder receives the same input structure as during training."
+        )
+
+    device = x1.device
+    miss_mask = torch.isnan(x2_with_nan)
+    x1_b = x1.unsqueeze(0)
+    c_b = c.unsqueeze(0)
+
+    x2_sib_b = None
+    x2_sib_flat = None
+    c_sib_flat = None
+    K_sib = 0
+    has_siblings = x2_siblings is not None
+
+    if has_siblings:
+        x2_sib_b = x2_siblings.to(device)
+        if x2_sib_b.dim() == 2:
+            x2_sib_b = x2_sib_b.unsqueeze(0)
+        if x2_sib_b.dim() != 3 or x2_sib_b.shape[0] != 1:
+            raise ValueError(
+                "x2_siblings must have shape (K, x2_dim) or (1, K, x2_dim)."
+            )
+        if torch.isnan(x2_sib_b).any():
+            raise ValueError(
+                "x2_siblings must be fully observed; NaNs are not supported here."
+            )
+
+        K_sib = x2_sib_b.shape[1]
+        if K_sib <= 0:
+            has_siblings = False
+            x2_sib_b = None
+        else:
+            if c_siblings is None:
+                raise ValueError("c_siblings is required when x2_siblings is provided.")
+            c_sib_b = c_siblings.to(device)
+            if c_sib_b.dim() == 2:
+                c_sib_b = c_sib_b.unsqueeze(0)
+            if c_sib_b.dim() != 3 or c_sib_b.shape[0] != 1 or c_sib_b.shape[1] != K_sib:
+                raise ValueError(
+                    "c_siblings must have shape (K, c_dim) or (1, K, c_dim)."
+                )
+
+            x2_sib_flat = x2_sib_b.reshape(K_sib, x2_sib_b.shape[-1])
+            c_sib_flat = c_sib_b.reshape(K_sib, c_sib_b.shape[-1])
+
+    with torch.no_grad():
+        enc_input_init = _z1_enc_input(
+            z1_input, x1_b=x1_b, x2_siblings=x2_sib_b, c2_siblings=c_sib_b
+        )
+        z_loc_init, z_scale_init = enc_z(enc_input_init)
+        z_curr = Normal(z_loc_init, z_scale_init).sample()
+
+        u_loc_init, _ = prior_u(z_curr, c_b)
+        x2_loc_init, _ = dec_u(u_loc_init, z_curr, c_b)
+
+    x2_curr = x2_with_nan.clone()
+    if miss_mask.all():
+        x2_curr = x2_loc_init.squeeze(0)
+    else:
+        x2_curr[miss_mask] = x2_loc_init.squeeze(0)[miss_mask]
+
+    with torch.no_grad():
+        u_loc, u_scale = enc_u(x2_curr.unsqueeze(0), z_curr, c_b)
+        u_curr = Normal(u_loc, u_scale).sample()
+
+        u_sib_curr = None
+        eps_sib_curr = None
+        if has_siblings:
+            z_sib = z_curr.expand(K_sib, -1)
+            u_sib_loc, u_sib_scale = enc_u(x2_sib_flat, z_sib, c_sib_flat)
+            u_sib_curr = Normal(u_sib_loc, u_sib_scale).sample()
+
+    def _mh_accept(log_alpha):
+        return torch.rand((), device=device).log().item() < float(
+            log_alpha.detach().cpu().sum()
+        )
+
+    def _log_lik_x1(z):
+        loc, log_scale = dec_z(z)
+        return _log_normal(x1_b, loc, torch.exp(log_scale))
+
+    def _log_q_z(
+        z,
+        x2_b,
+    ):
+        enc_input = _z1_enc_input(
+            z1_input,
+            x1_b,
+            x2_b,
+            x2_siblings=x2_siblings,
+            c2_b=c_b,
+            c2_siblings=c_sib_b,
+        )
+        loc, scale = enc_z(enc_input)
+        return _log_normal(z, loc, scale)
+
+    def _log_prior_u(u, z, c_in):
+        loc, scale = prior_u(z, c_in)
+        return _log_normal(u, loc, scale)
+
+    def _log_lik_x2(x2_b, u, z, c_in):
+        loc, log_scale = dec_u(u, z, c_in)
+        return _log_normal(x2_b, loc, torch.exp(log_scale))
+
+    def _log_q_u(u, x2_b, z, c_in):
+        loc, scale = enc_u(x2_b, z, c_in)
+        return _log_normal(u, loc, scale)
+
+    def _u_from_eps(eps, z, c_in):
+        loc, scale = prior_u(z, c_in)
+        return loc + scale * eps
+
+    def _eps_from_u(u, z, c_in):
+        loc, scale = prior_u(z, c_in)
+        return (u - loc) / scale
+
+    def _u_sib_from_eps(eps_sib, z):
+        z_sib = z.expand(K_sib, -1)
+        loc, scale = prior_u(z_sib, c_sib_flat)
+        return loc + scale * eps_sib
+
+    def _eps_sib_from_u(u_sib, z):
+        z_sib = z.expand(K_sib, -1)
+        loc, scale = prior_u(z_sib, c_sib_flat)
+        return (u_sib - loc) / scale
+
+    def _log_siblings_centered(z, u_sib):
+        if not has_siblings:
+            return torch.zeros((), device=device)
+        z_sib = z.expand(K_sib, -1)
+        return (
+            _log_prior_u(u_sib, z_sib, c_sib_flat).sum()
+            + _log_lik_x2(x2_sib_flat, u_sib, z_sib, c_sib_flat).sum()
+        )
+
+    def _log_siblings_noncentered(z, eps_sib):
+        if not has_siblings:
+            return torch.zeros((), device=device)
+        z_sib = z.expand(K_sib, -1)
+        u_sib = _u_sib_from_eps(eps_sib, z)
+        return _log_lik_x2(x2_sib_flat, u_sib, z_sib, c_sib_flat).sum()
+
+    with torch.no_grad():
+        eps_curr = None
+        if use_noncentered:
+            eps_curr = _eps_from_u(u_curr, z_curr, c_b)
+            if has_siblings:
+                eps_sib_curr = _eps_sib_from_u(u_sib_curr, z_curr)
+
+    miss_samples: list[np.ndarray] = []
+    full_samples: list[np.ndarray] = []
+    n_accept_z = 0
+    n_accept_u = 0
+    n_accept_sib = 0
+    n_attempt_sib = 0
+
+    for t in range(num_steps):
+        with torch.no_grad():
+            x2_b = x2_curr.unsqueeze(0)
+
+            # Block 1 — MH for z
+            enc_input = _z1_enc_input(
+                z1_input,
+                x1_b=x1_b,
+                x2_b=x2_b,
+                x2_siblings=x2_sib_b,
+                c2_b=c_b,
+                c2_siblings=c_sib_b,
+            )
+            z_loc_p, z_scale_p = enc_z(enc_input)
+            z_prop = Normal(z_loc_p, z_scale_p).sample()
+
+            if use_noncentered:
+                u_prop_z = _u_from_eps(eps_curr, z_prop, c_b)
+                u_curr_z = _u_from_eps(eps_curr, z_curr, c_b)
+
+                log_p_z_prop = (
+                    _log_prior_z(z_prop)
+                    + _log_lik_x1(z_prop)
+                    + _log_lik_x2(x2_b, u_prop_z, z_prop, c_b)
+                    + _log_siblings_noncentered(z_prop, eps_sib_curr)
+                )
+                log_p_z_curr = (
+                    _log_prior_z(z_curr)
+                    + _log_lik_x1(z_curr)
+                    + _log_lik_x2(x2_b, u_curr_z, z_curr, c_b)
+                    + _log_siblings_noncentered(z_curr, eps_sib_curr)
+                )
+            else:
+                log_p_z_prop = (
+                    _log_prior_z(z_prop)
+                    + _log_lik_x1(z_prop)
+                    + _log_prior_u(u_curr, z_prop, c_b)
+                    + _log_lik_x2(x2_b, u_curr, z_prop, c_b)
+                    + _log_siblings_centered(z_prop, u_sib_curr)
+                )
+                log_p_z_curr = (
+                    _log_prior_z(z_curr)
+                    + _log_lik_x1(z_curr)
+                    + _log_prior_u(u_curr, z_curr, c_b)
+                    + _log_lik_x2(x2_b, u_curr, z_curr, c_b)
+                    + _log_siblings_centered(z_curr, u_sib_curr)
+                )
+
+            log_q_z_fwd = _log_q_z(z_prop, x2_b)
+            log_q_z_rev = _log_q_z(z_curr, x2_b)
+
+            if use_mh:
+                log_alpha_z = log_p_z_prop + log_q_z_rev - log_p_z_curr - log_q_z_fwd
+                accept_z = _mh_accept(log_alpha_z)
+            else:
+                accept_z = True
+
+            if accept_z:
+                z_curr = z_prop
+                n_accept_z += 1
+                if use_noncentered:
+                    u_curr = _u_from_eps(eps_curr, z_curr, c_b)
+                    if has_siblings:
+                        u_sib_curr = _u_sib_from_eps(eps_sib_curr, z_curr)
+
+            # Block 2 — MH for target-child u, or eps if non-centred
+            u_loc_p, u_scale_p = enc_u(x2_b, z_curr, c_b)
+            u_prop = Normal(u_loc_p, u_scale_p).sample()
+
+            if use_noncentered:
+                eps_prop = _eps_from_u(u_prop, z_curr, c_b)
+                u_curr = _u_from_eps(eps_curr, z_curr, c_b)
+
+                log_p_u_prop = _log_prior_z(eps_prop) + _log_lik_x2(
+                    x2_b, u_prop, z_curr, c_b
+                )
+                log_p_u_curr = _log_prior_z(eps_curr) + _log_lik_x2(
+                    x2_b, u_curr, z_curr, c_b
+                )
+            else:
+                log_p_u_prop = _log_prior_u(u_prop, z_curr, c_b) + _log_lik_x2(
+                    x2_b, u_prop, z_curr, c_b
+                )
+                log_p_u_curr = _log_prior_u(u_curr, z_curr, c_b) + _log_lik_x2(
+                    x2_b, u_curr, z_curr, c_b
+                )
+
+            log_q_u_fwd = _log_q_u(u_prop, x2_b, z_curr, c_b)
+            log_q_u_rev = _log_q_u(u_curr, x2_b, z_curr, c_b)
+
+            if use_mh:
+                log_alpha_u = log_p_u_prop + log_q_u_rev - log_p_u_curr - log_q_u_fwd
+                accept_u = _mh_accept(log_alpha_u)
+            else:
+                accept_u = True
+
+            if accept_u:
+                u_curr = u_prop
+                n_accept_u += 1
+                if use_noncentered:
+                    eps_curr = eps_prop
+
+            # Block 3 — vectorised independent MH updates for all siblings
+            if has_siblings:
+                z_sib = z_curr.expand(K_sib, -1)
+
+                u_sib_loc_p, u_sib_scale_p = enc_u(x2_sib_flat, z_sib, c_sib_flat)
+                u_sib_prop = Normal(u_sib_loc_p, u_sib_scale_p).sample()
+
+                if use_noncentered:
+                    eps_sib_prop = _eps_sib_from_u(u_sib_prop, z_curr)
+                    u_sib_curr_z = _u_sib_from_eps(eps_sib_curr, z_curr)
+
+                    log_p_s_prop = _log_prior_z(eps_sib_prop) + _log_lik_x2(
+                        x2_sib_flat, u_sib_prop, z_sib, c_sib_flat
+                    )
+                    log_p_s_curr = _log_prior_z(eps_sib_curr) + _log_lik_x2(
+                        x2_sib_flat, u_sib_curr_z, z_sib, c_sib_flat
+                    )
+                else:
+                    u_sib_curr_z = u_sib_curr
+                    log_p_s_prop = _log_prior_u(
+                        u_sib_prop, z_sib, c_sib_flat
+                    ) + _log_lik_x2(x2_sib_flat, u_sib_prop, z_sib, c_sib_flat)
+                    log_p_s_curr = _log_prior_u(
+                        u_sib_curr_z, z_sib, c_sib_flat
+                    ) + _log_lik_x2(x2_sib_flat, u_sib_curr_z, z_sib, c_sib_flat)
+
+                log_q_s_fwd = _log_q_u(u_sib_prop, x2_sib_flat, z_sib, c_sib_flat)
+                log_q_s_rev = _log_q_u(u_sib_curr_z, x2_sib_flat, z_sib, c_sib_flat)
+                log_alpha_s = log_p_s_prop + log_q_s_rev - log_p_s_curr - log_q_s_fwd
+
+                n_attempt_sib += K_sib
+                if use_mh:
+                    accept_s = (
+                        torch.rand(K_sib, device=device).log() < log_alpha_s.detach()
+                    )
+                else:
+                    accept_s = torch.ones(K_sib, dtype=torch.bool, device=device)
+
+                n_accept_sib += int(accept_s.sum().item())
+                accept_s_expanded = accept_s.unsqueeze(-1)
+                u_sib_curr = torch.where(accept_s_expanded, u_sib_prop, u_sib_curr_z)
+                if use_noncentered:
+                    eps_sib_curr = torch.where(
+                        accept_s_expanded, eps_sib_prop, eps_sib_curr
+                    )
+
+            # Gibbs step for x2_miss
+            if use_noncentered:
+                u_curr = _u_from_eps(eps_curr, z_curr, c_b)
+
+            x2_loc, log_x2_scale = dec_u(u_curr, z_curr, c_b)
+            x2_draw = Normal(x2_loc, torch.exp(log_x2_scale)).sample().squeeze(0)
+            x2_curr[miss_mask] = x2_draw[miss_mask]
+
+            if t >= burn_in:
+                miss_samples.append(x2_curr[miss_mask].clone().cpu().numpy())
+                full_samples.append(x2_curr.clone().cpu().numpy())
+
+    accept_rate_z = n_accept_z / num_steps
+    accept_rate_u = n_accept_u / num_steps
+    accept_rate_sib = None if n_attempt_sib == 0 else n_accept_sib / n_attempt_sib
+
+    miss_samples_arr = np.stack(miss_samples, axis=0)
+    full_samples_arr = np.stack(full_samples, axis=0)
+
+    x2_imputed = x2_with_nan.cpu().numpy().copy()
+    x2_imputed[miss_mask.cpu().numpy()] = miss_samples_arr.mean(axis=0)
+
+    return (
+        x2_imputed,
+        miss_samples_arr,
+        full_samples_arr,
+        accept_rate_z,
+        accept_rate_u,
+        accept_rate_sib,
+    )
+
+
 # ============================================================================
 # Approximate sequential — exact z, MH for u only
 # ============================================================================
@@ -713,11 +1199,12 @@ def hvae_mcmc_impute_approx(
     num_steps=5000,
     burn_in=500,
     x2_siblings=None,
+    c2_siblings=None,
     use_mh=True,
 ):
     """Simplified imputation assuming the global encoder is exact.
 
-    The global encoder ``q(z | x1, {x2})`` is treated as a perfect
+    The global encoder ``q(z | x1, {x2, c2})`` is treated as a perfect
     approximation to the full conditional ``p(z | x1, x2, u, c)``, so
     every z proposal is **accepted without an MH correction**.  Only the
     child latent u goes through an MH accept/reject step.
@@ -731,7 +1218,7 @@ def hvae_mcmc_impute_approx(
 
     1. **Direct draw for z** — always accepted:
 
-           z  ←  z* ~ q(z | x1, {x2_curr})
+           z  ←  z* ~ q(z | x1, {x2_curr, c2})
 
     2. **MH for u** (z held fixed):
 
@@ -749,6 +1236,8 @@ def hvae_mcmc_impute_approx(
     c            : Tensor (c_dim,)
     num_steps    : int
     burn_in      : int
+    x2_siblings  : Tensor (1, K, x2_dim), optional
+    c2_siblings  : Tensor (1, K, c2_dim), optional
     use_mh       : bool
 
     Returns
@@ -761,12 +1250,7 @@ def hvae_mcmc_impute_approx(
     enc_z, dec_z, enc_u, dec_u, prior_u, _, _, z1_input = _get_hvae_methods(vae)
     vae.eval()
 
-    if getattr(vae, "use_full_posterior", False) and x2_siblings is None:
-        raise ValueError(
-            "Model was trained with use_full_posterior=True but x2_siblings "
-            "was not provided. Pass the observed sibling x2s so the "
-            "SetEncoder receives the same input structure as during training."
-        )
+    _validate_full_posterior_inputs(vae, x2_siblings, c2_siblings)
 
     miss_mask = torch.isnan(x2_with_nan)
     x1_b = x1.unsqueeze(0)
@@ -776,7 +1260,12 @@ def hvae_mcmc_impute_approx(
     # Warm-start — use siblings for summary if available
     # ------------------------------------------------------------------
     with torch.no_grad():
-        enc_input_init = _z1_enc_input(z1_input, x1_b, x2_siblings=x2_siblings)
+        enc_input_init = _z1_enc_input(
+            z1_input,
+            x1_b,
+            x2_siblings=x2_siblings,
+            c2_siblings=c2_siblings,
+        )
         z_loc_init, z_scale_init = enc_z(enc_input_init)
         z_curr = Normal(z_loc_init, z_scale_init).sample()
 
@@ -822,7 +1311,14 @@ def hvae_mcmc_impute_approx(
             # ==============================================================
             # Direct draw for z  (encoder assumed exact — always accepted)
             # ==============================================================
-            enc_input = _z1_enc_input(z1_input, x1_b, x2_b, x2_siblings=x2_siblings)
+            enc_input = _z1_enc_input(
+                z1_input,
+                x1_b,
+                x2_b,
+                x2_siblings=x2_siblings,
+                c2_b=c_b,
+                c2_siblings=c2_siblings,
+            )
             z_loc_p, z_scale_p = enc_z(enc_input)
             z_curr = Normal(z_loc_p, z_scale_p).sample()
 
@@ -905,6 +1401,7 @@ def hvae_ps_mcmc_impute(
     num_steps=5000,
     burn_in=500,
     x2_siblings=None,
+    c2_siblings=None,
     use_mh=True,
 ):
     """Impute missing entries in x2 via PS-HVAE joint MH-within-Gibbs.
@@ -920,7 +1417,7 @@ def hvae_ps_mcmc_impute(
 
     Proposal (ancestral)
     ====================
-        z*  ~ q(z | x1, {x2})
+        z*  ~ q(z | x1, {x2, c2})
         u*  ~ q(u | x2, z*, c)
         zp* ~ q(z_p | x2, c)
 
@@ -932,6 +1429,8 @@ def hvae_ps_mcmc_impute(
     c            : Tensor (c_dim,)  — conditioning vector (c2 for the child).
     num_steps    : int
     burn_in      : int
+    x2_siblings  : Tensor (1, K, x2_dim), optional
+    c2_siblings  : Tensor (1, K, c2_dim), optional
     use_mh       : bool
 
     Returns
@@ -946,12 +1445,7 @@ def hvae_ps_mcmc_impute(
     )
     vae.eval()
 
-    if getattr(vae, "use_full_posterior", False) and x2_siblings is None:
-        raise ValueError(
-            "Model was trained with use_full_posterior=True but x2_siblings "
-            "was not provided. Pass the observed sibling x2s so the "
-            "SetEncoder receives the same input structure as during training."
-        )
+    _validate_full_posterior_inputs(vae, x2_siblings, c2_siblings)
 
     miss_mask = torch.isnan(x2_with_nan)
     x1_b = x1.unsqueeze(0)
@@ -961,7 +1455,12 @@ def hvae_ps_mcmc_impute(
     # Warm-start — use siblings for summary if available
     # ------------------------------------------------------------------
     with torch.no_grad():
-        enc_input_init = _z1_enc_input(z1_input, x1_b, x2_siblings=x2_siblings)
+        enc_input_init = _z1_enc_input(
+            z1_input,
+            x1_b,
+            x2_siblings=x2_siblings,
+            c2_siblings=c2_siblings,
+        )
         z_loc_init, z_scale_init = enc_z(enc_input_init)
         z_curr = Normal(z_loc_init, z_scale_init).sample()
 
@@ -989,7 +1488,14 @@ def hvae_ps_mcmc_impute(
         return _log_normal(x1_b, loc, torch.exp(log_scale))
 
     def _log_q_z(z, x2_b):
-        enc_input = _z1_enc_input(z1_input, x1_b, x2_b, x2_siblings=x2_siblings)
+        enc_input = _z1_enc_input(
+            z1_input,
+            x1_b,
+            x2_b,
+            x2_siblings=x2_siblings,
+            c2_b=c_b,
+            c2_siblings=c2_siblings,
+        )
         loc, scale = enc_z(enc_input)
         return _log_normal(z, loc, scale)
 
@@ -1024,7 +1530,14 @@ def hvae_ps_mcmc_impute(
             # Joint MH step for (z, u, z_private)
             # ==============================================================
             # Ancestral proposal
-            enc_input = _z1_enc_input(z1_input, x1_b, x2_b, x2_siblings=x2_siblings)
+            enc_input = _z1_enc_input(
+                z1_input,
+                x1_b,
+                x2_b,
+                x2_siblings=x2_siblings,
+                c2_b=c_b,
+                c2_siblings=c2_siblings,
+            )
             z_loc_p, z_scale_p = enc_z(enc_input)
             z_prop = Normal(z_loc_p, z_scale_p).sample()
 
@@ -1113,6 +1626,7 @@ def hvae_ps_mcmc_impute_sequential(
     num_steps=5000,
     burn_in=500,
     x2_siblings=None,
+    c2_siblings=None,
     use_mh=True,
 ):
     """Impute missing x2 via PS-HVAE with sequential block MH.
@@ -1132,6 +1646,8 @@ def hvae_ps_mcmc_impute_sequential(
     c            : Tensor (c_dim,)
     num_steps    : int
     burn_in      : int
+    x2_siblings  : Tensor (1, K, x2_dim), optional
+    c2_siblings  : Tensor (1, K, c2_dim), optional
     use_mh       : bool
 
     Returns
@@ -1148,12 +1664,7 @@ def hvae_ps_mcmc_impute_sequential(
     )
     vae.eval()
 
-    if getattr(vae, "use_full_posterior", False) and x2_siblings is None:
-        raise ValueError(
-            "Model was trained with use_full_posterior=True but x2_siblings "
-            "was not provided. Pass the observed sibling x2s so the "
-            "SetEncoder receives the same input structure as during training."
-        )
+    _validate_full_posterior_inputs(vae, x2_siblings, c2_siblings)
 
     miss_mask = torch.isnan(x2_with_nan)
     x1_b = x1.unsqueeze(0)
@@ -1163,7 +1674,12 @@ def hvae_ps_mcmc_impute_sequential(
     # Warm-start — use siblings for summary if available
     # ------------------------------------------------------------------
     with torch.no_grad():
-        enc_input_init = _z1_enc_input(z1_input, x1_b, x2_siblings=x2_siblings)
+        enc_input_init = _z1_enc_input(
+            z1_input,
+            x1_b,
+            x2_siblings=x2_siblings,
+            c2_siblings=c2_siblings,
+        )
         z_loc_init, z_scale_init = enc_z(enc_input_init)
         z_curr = Normal(z_loc_init, z_scale_init).sample()
 
@@ -1191,7 +1707,14 @@ def hvae_ps_mcmc_impute_sequential(
         return _log_normal(x1_b, loc, torch.exp(log_scale))
 
     def _log_q_z(z, x2_b):
-        enc_input = _z1_enc_input(z1_input, x1_b, x2_b, x2_siblings=x2_siblings)
+        enc_input = _z1_enc_input(
+            z1_input,
+            x1_b,
+            x2_b,
+            x2_siblings=x2_siblings,
+            c2_b=c_b,
+            c2_siblings=c2_siblings,
+        )
         loc, scale = enc_z(enc_input)
         return _log_normal(z, loc, scale)
 
@@ -1227,7 +1750,14 @@ def hvae_ps_mcmc_impute_sequential(
             # ==============================================================
             # Block 1 — MH for z  (u, z_private held fixed)
             # ==============================================================
-            enc_input = _z1_enc_input(z1_input, x1_b, x2_b, x2_siblings=x2_siblings)
+            enc_input = _z1_enc_input(
+                z1_input,
+                x1_b,
+                x2_b,
+                x2_siblings=x2_siblings,
+                c2_b=c_b,
+                c2_siblings=c2_siblings,
+            )
             z_loc_p, z_scale_p = enc_z(enc_input)
             z_prop = Normal(z_loc_p, z_scale_p).sample()
 

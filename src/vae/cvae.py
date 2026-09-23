@@ -2,17 +2,19 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
-from typing import Iterable
+import warnings
+from collections.abc import Iterable, Sequence
 
 import pyro
 import pyro.distributions as dist
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from pyro.infer import SVI, Trace_ELBO
 from pyro.optim import Adam
+from torch import nn
 
 from src.dHSIC import make_elbo_hsic
+from src.vae.training import EpochMetrics, TrainingConfig, TrainingStatus, train_svi
 from src.vae.utils.vae_plots import plot_llk
 
 pyro.set_rng_seed(42)
@@ -20,7 +22,9 @@ torch.manual_seed(42)
 
 
 class Encoder(nn.Module):
-    def __init__(self, x_dim, c_dim, z_dim, hidden_dim):
+    """Encode observations and conditioning into latent parameters."""
+
+    def __init__(self, x_dim, c_dim, z_dim, hidden_dim) -> None:
         super().__init__()
         self.x_dim = x_dim
         self.c_dim = c_dim
@@ -29,7 +33,10 @@ class Encoder(nn.Module):
         self.fc22 = nn.Linear(hidden_dim, z_dim)
         self.softplus = nn.Softplus()
 
-    def forward(self, x, c):
+    def forward(
+        self, x: torch.Tensor, c: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the latent location and scale for a conditioned batch."""
         x = x.reshape(-1, self.x_dim)
         c = c.reshape(-1, self.c_dim)
         xc = torch.cat([x, c], dim=-1)
@@ -42,7 +49,9 @@ class Encoder(nn.Module):
 
 
 class EncoderNoCond(nn.Module):
-    def __init__(self, x_dim, z_dim, hidden_dim):
+    """Encode observations into latent parameters without conditioning."""
+
+    def __init__(self, x_dim, z_dim, hidden_dim) -> None:
         super().__init__()
         self.x_dim = x_dim
         self.fc1 = nn.Linear(x_dim, hidden_dim)
@@ -50,7 +59,10 @@ class EncoderNoCond(nn.Module):
         self.fc22 = nn.Linear(hidden_dim, z_dim)
         self.softplus = nn.Softplus()
 
-    def forward(self, x, _):
+    def forward(
+        self, x: torch.Tensor, _: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the latent location and scale for an unconditioned batch."""
         x = x.reshape(-1, self.x_dim)
 
         hidden = self.softplus(self.fc1(x))
@@ -60,14 +72,19 @@ class EncoderNoCond(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, x_dim, z_dim, c_dim, hidden_dim):
+    """Decode latent draws and conditioning into Gaussian parameters."""
+
+    def __init__(self, x_dim, z_dim, c_dim, hidden_dim) -> None:
         super().__init__()
         self.fc1 = nn.Linear(z_dim + c_dim, hidden_dim)
         self.fc21 = nn.Linear(hidden_dim, x_dim)
         self.softplus = nn.Softplus()
         self.log_x_scale = nn.Parameter(torch.zeros(x_dim))
 
-    def forward(self, z, c):
+    def forward(
+        self, z: torch.Tensor, c: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the decoded observation mean and log scale."""
         zc = torch.cat([z, c], dim=-1)
         hidden = self.softplus(self.fc1(zc))
         x_loc = self.fc21(hidden)
@@ -75,7 +92,9 @@ class Decoder(nn.Module):
 
 
 class DecoderVolScaling(nn.Module):
-    def __init__(self, x_dim, z_dim, c_dim, hidden_dim):
+    """Decode latent draws with FiLM-style conditioning on the hidden state."""
+
+    def __init__(self, x_dim, z_dim, c_dim, hidden_dim) -> None:
         super().__init__()
         self.fc1 = nn.Linear(z_dim + c_dim, hidden_dim)
         self.softplus = nn.Softplus()
@@ -84,7 +103,10 @@ class DecoderVolScaling(nn.Module):
         self.fc21 = nn.Linear(hidden_dim, x_dim)
         self.fc22 = nn.Linear(hidden_dim, x_dim)
 
-    def forward(self, z, c):
+    def forward(
+        self, z: torch.Tensor, c: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the decoded observation mean and log scale."""
         zc = torch.cat([z, c], dim=-1)
         hidden = self.fc1(zc)
         scale = self.film_scale(c)
@@ -96,7 +118,9 @@ class DecoderVolScaling(nn.Module):
 
 
 class PriorNetwork(nn.Module):
-    def __init__(self, c_dim, z_dim, hidden_dim=50):
+    """Map conditioning features to a diagonal-Gaussian latent prior."""
+
+    def __init__(self, c_dim, z_dim, hidden_dim=50) -> None:
         super().__init__()
         self.c_dim = c_dim
         self.net = nn.Sequential(
@@ -106,7 +130,8 @@ class PriorNetwork(nn.Module):
         self.fc_loc = nn.Linear(hidden_dim, z_dim)
         self.fc_scale = nn.Linear(hidden_dim, z_dim)
 
-    def forward(self, c):
+    def forward(self, c: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the prior location and scale for a conditioned batch."""
         c = c.reshape(-1, self.c_dim)
         hidden = self.net(c)
         z_loc = self.fc_loc(hidden)
@@ -115,7 +140,9 @@ class PriorNetwork(nn.Module):
 
 
 class LatentScale(nn.Module):
-    def __init__(self, c_dim, z_dim, hidden_dim=50):
+    """Map conditioning features to a positive latent scale."""
+
+    def __init__(self, c_dim, z_dim, hidden_dim=50) -> None:
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(c_dim, hidden_dim),
@@ -123,12 +150,15 @@ class LatentScale(nn.Module):
             nn.Linear(hidden_dim, z_dim),
         )
 
-    def forward(self, c):
-        return (F.sigmoid(self.net(c)) * 20) + 1e-4
+    def forward(self, c: torch.Tensor) -> torch.Tensor:
+        """Return a positive latent scale for a conditioned batch."""
+        return (torch.sigmoid(self.net(c)) * 20) + 1e-4
 
 
 class CVAE(nn.Module):
-    def __init__(self, x_dim, c_dim, z_dim=50, hidden_dim=400, use_cuda=False):
+    """Fit a conditional VAE with a learned latent prior network."""
+
+    def __init__(self, x_dim, c_dim, z_dim=50, hidden_dim=400, use_cuda=False) -> None:
         super().__init__()
         self.x_dim = x_dim
         self.c_dim = c_dim
@@ -142,7 +172,30 @@ class CVAE(nn.Module):
         self.use_cuda = use_cuda
         self.z_dim = z_dim
 
-    def model(self, x, c, annealing_factor=1):
+    def fit(
+        self,
+        train_loader: Iterable[Sequence[torch.Tensor] | torch.Tensor],
+        validation_loader: Iterable[Sequence[torch.Tensor] | torch.Tensor],
+        *,
+        config: TrainingConfig,
+        device: str | torch.device | None = None,
+    ) -> tuple[TrainingStatus, list[EpochMetrics]]:
+        """Fit on ``(x, c)`` batches shaped ``(B, x_dim)``, ``(B, c_dim)``.
+
+        Return the status and epoch metrics; HSIC is unsupported.
+        """
+        return train_svi(
+            self,
+            train_loader,
+            validation_loader,
+            config=config,
+            device=device,
+        )
+
+    def model(
+        self, x: torch.Tensor, c: torch.Tensor, annealing_factor: float = 1.0
+    ) -> torch.Tensor:
+        """Define the conditional generative model for a batch of observations."""
         pyro.module("decoder", self.decoder)
         pyro.module("prior_network", self.prior_network)
         with pyro.plate("data", x.shape[0]):
@@ -151,7 +204,7 @@ class CVAE(nn.Module):
             with pyro.poutine.scale(scale=annealing_factor):
                 z = pyro.sample("latent", dist.Normal(z_loc, z_scale).to_event(1))
 
-            x_loc, log_x_scale = self.decoder.forward(z, c)
+            x_loc, log_x_scale = self.decoder(z, c)
             x_scale = torch.exp(log_x_scale).expand_as(x_loc)
 
             pyro.sample(
@@ -161,32 +214,42 @@ class CVAE(nn.Module):
             )
             return x_loc
 
-    def guide(self, x, c, annealing_factor=1):
+    def guide(
+        self, x: torch.Tensor, c: torch.Tensor, annealing_factor: float = 1.0
+    ) -> None:
+        """Define the conditional variational posterior for a batch."""
         pyro.module("encoder", self.encoder)
         with pyro.plate("data", x.shape[0]):
-            z_loc, z_scale = self.encoder.forward(x, c)
+            z_loc, z_scale = self.encoder(x, c)
             with pyro.poutine.scale(scale=annealing_factor):
                 pyro.sample("latent", dist.Normal(z_loc, z_scale).to_event(1))
 
-    def reconstruct(self, x, c):
+    def reconstruct(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """Return a stochastic reconstruction for a conditioned batch."""
         z_loc, z_scale = self.encoder(x, c)
         z = dist.Normal(z_loc, z_scale).sample()
         x_loc, _ = self.decoder(z, c)
         return x_loc
 
-    def reconstruct_map(self, x, c):
+    def reconstruct_map(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """Return the deterministic reconstruction for a conditioned batch."""
         z_loc, _ = self.encoder(x, c)
         x_loc, _ = self.decoder(z_loc, c)
         return x_loc
 
-    def counterfactual_prediction(self, x, c1, c2):
+    def counterfactual_prediction(
+        self, x: torch.Tensor, c1: torch.Tensor, c2: torch.Tensor
+    ) -> torch.Tensor:
+        """Decode the posterior latent from one condition under a new condition."""
         z_loc, _ = self.encoder(x, c1)
         x_loc, _ = self.decoder(z_loc, c2)
         return x_loc
 
 
 class CVAEVolClustering(nn.Module):
-    def __init__(self, x_dim, c_dim, z_dim=50, hidden_dim=400, use_cuda=False):
+    """Fit a conditional VAE with FiLM-style decoder scaling."""
+
+    def __init__(self, x_dim, c_dim, z_dim=50, hidden_dim=400, use_cuda=False) -> None:
         super().__init__()
         self.x_dim = x_dim
         self.c_dim = c_dim
@@ -199,7 +262,30 @@ class CVAEVolClustering(nn.Module):
         self.use_cuda = use_cuda
         self.z_dim = z_dim
 
-    def model(self, x, c, annealing_factor=1):
+    def fit(
+        self,
+        train_loader: Iterable[Sequence[torch.Tensor] | torch.Tensor],
+        validation_loader: Iterable[Sequence[torch.Tensor] | torch.Tensor],
+        *,
+        config: TrainingConfig,
+        device: str | torch.device | None = None,
+    ) -> tuple[TrainingStatus, list[EpochMetrics]]:
+        """Fit on ``(x, c)`` batches shaped ``(B, x_dim)``, ``(B, c_dim)``.
+
+        Return the status and epoch metrics; HSIC is unsupported.
+        """
+        return train_svi(
+            self,
+            train_loader,
+            validation_loader,
+            config=config,
+            device=device,
+        )
+
+    def model(
+        self, x: torch.Tensor, c: torch.Tensor, annealing_factor: float = 1.0
+    ) -> torch.Tensor:
+        """Define the FiLM-scaled conditional generative model for a batch."""
         pyro.module("decoder", self.decoder)
 
         with pyro.plate("data", x.shape[0]):
@@ -209,7 +295,7 @@ class CVAEVolClustering(nn.Module):
             with pyro.poutine.scale(scale=annealing_factor):
                 z = pyro.sample("latent", dist.Normal(z_loc, z_scale).to_event(1))
 
-            x_loc, log_x_scale = self.decoder.forward(z, c)
+            x_loc, log_x_scale = self.decoder(z, c)
             x_scale = torch.exp(log_x_scale)
 
             pyro.sample(
@@ -219,32 +305,42 @@ class CVAEVolClustering(nn.Module):
             )
             return x_loc
 
-    def guide(self, x, c, annealing_factor=1):
+    def guide(
+        self, x: torch.Tensor, c: torch.Tensor, annealing_factor: float = 1.0
+    ) -> None:
+        """Define the FiLM-scaled conditional variational posterior for a batch."""
         pyro.module("encoder", self.encoder)
         with pyro.plate("data", x.shape[0]):
-            z_loc, z_scale = self.encoder.forward(x, c)
+            z_loc, z_scale = self.encoder(x, c)
             with pyro.poutine.scale(scale=annealing_factor):
                 pyro.sample("latent", dist.Normal(z_loc, z_scale).to_event(1))
 
-    def reconstruct(self, x, c):
+    def reconstruct(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """Return a stochastic FiLM-scaled reconstruction for a conditioned batch."""
         z_loc, z_scale = self.encoder(x, c)
         z = dist.Normal(z_loc, z_scale).sample()
         x_loc, _ = self.decoder(z, c)
         return x_loc
 
-    def reconstruct_map(self, x, c):
+    def reconstruct_map(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """Return the deterministic FiLM-scaled reconstruction for a conditioned batch."""
         z_loc, _ = self.encoder(x, c)
         x_loc, _ = self.decoder(z_loc, c)
         return x_loc
 
-    def counterfactual_prediction(self, x, c1, c2):
+    def counterfactual_prediction(
+        self, x: torch.Tensor, c1: torch.Tensor, c2: torch.Tensor
+    ) -> torch.Tensor:
+        """Decode the posterior latent from one condition under a new condition."""
         z_loc, _ = self.encoder(x, c1)
         x_loc, _ = self.decoder(z_loc, c2)
         return x_loc
 
 
 class CVAEEteroschPrior(nn.Module):
-    def __init__(self, x_dim, c_dim, z_dim=50, hidden_dim=400, use_cuda=False):
+    """Fit a conditional VAE with a heteroscedastic latent prior scale."""
+
+    def __init__(self, x_dim, c_dim, z_dim=50, hidden_dim=400, use_cuda=False) -> None:
         super().__init__()
         self.x_dim = x_dim
         self.c_dim = c_dim
@@ -258,7 +354,30 @@ class CVAEEteroschPrior(nn.Module):
         self.use_cuda = use_cuda
         self.z_dim = z_dim
 
-    def model(self, x, c, annealing_factor=1):
+    def fit(
+        self,
+        train_loader: Iterable[Sequence[torch.Tensor] | torch.Tensor],
+        validation_loader: Iterable[Sequence[torch.Tensor] | torch.Tensor],
+        *,
+        config: TrainingConfig,
+        device: str | torch.device | None = None,
+    ) -> tuple[TrainingStatus, list[EpochMetrics]]:
+        """Fit on ``(x, c)`` batches shaped ``(B, x_dim)``, ``(B, c_dim)``.
+
+        Return the status and epoch metrics; HSIC is unsupported.
+        """
+        return train_svi(
+            self,
+            train_loader,
+            validation_loader,
+            config=config,
+            device=device,
+        )
+
+    def model(
+        self, x: torch.Tensor, c: torch.Tensor, annealing_factor: float = 1.0
+    ) -> torch.Tensor:
+        """Define the heteroscedastic-prior conditional generative model for a batch."""
         pyro.module("decoder", self.decoder)
         pyro.module("prior_scale", self.prior_scale)
 
@@ -269,7 +388,7 @@ class CVAEEteroschPrior(nn.Module):
             with pyro.poutine.scale(scale=annealing_factor):
                 z = pyro.sample("latent", dist.Normal(z_loc, z_scale).to_event(1))
 
-            x_loc, log_x_scale = self.decoder.forward(z, c)
+            x_loc, log_x_scale = self.decoder(z, c)
             x_scale = torch.exp(log_x_scale)
 
             pyro.sample(
@@ -279,25 +398,33 @@ class CVAEEteroschPrior(nn.Module):
             )
             return x_loc
 
-    def guide(self, x, c, annealing_factor=1):
+    def guide(
+        self, x: torch.Tensor, c: torch.Tensor, annealing_factor: float = 1.0
+    ) -> None:
+        """Define the heteroscedastic-prior variational posterior for a batch."""
         pyro.module("encoder", self.encoder)
         with pyro.plate("data", x.shape[0]):
-            z_loc, z_scale = self.encoder.forward(x, c)
+            z_loc, z_scale = self.encoder(x, c)
             with pyro.poutine.scale(scale=annealing_factor):
                 pyro.sample("latent", dist.Normal(z_loc, z_scale).to_event(1))
 
-    def reconstruct(self, x, c):
+    def reconstruct(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """Return a stochastic reconstruction for a conditioned batch."""
         z_loc, z_scale = self.encoder(x, c)
         z = dist.Normal(z_loc, z_scale).sample()
         x_loc, _ = self.decoder(z, c)
         return x_loc
 
-    def reconstruct_map(self, x, c):
+    def reconstruct_map(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """Return the deterministic reconstruction for a conditioned batch."""
         z_loc, _ = self.encoder(x, c)
         x_loc, _ = self.decoder(z_loc, c)
         return x_loc
 
-    def counterfactual_prediction(self, x, c1, c2):
+    def counterfactual_prediction(
+        self, x: torch.Tensor, c1: torch.Tensor, c2: torch.Tensor
+    ) -> torch.Tensor:
+        """Decode the posterior latent from one condition under a new condition."""
         z_loc, _ = self.encoder(x, c1)
         x_loc, _ = self.decoder(z_loc, c2)
         return x_loc
@@ -317,7 +444,16 @@ def train(
     test_frequency=5,
     learning_rate=1.0e-3,
     cuda=False,
-):
+) -> CVAEEteroschPrior | CVAE:
+    """Train a conditional VAE on loaders that yield `(x, c)` batches.
+
+    Deprecated: instantiate the desired CVAE class and call ``fit()`` instead.
+    """
+    warnings.warn(
+        "cvae.train() is deprecated; instantiate a CVAE and call fit() instead",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     # clear param store
     pyro.clear_param_store()
 

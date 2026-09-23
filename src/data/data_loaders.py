@@ -1,3 +1,4 @@
+from decimal import Decimal
 from functools import reduce
 from pathlib import Path
 
@@ -102,6 +103,11 @@ def attach_conditional_features(
     return output
 
 
+def _training_count(n_rows: int, train_split: float) -> int:
+    """Truncate the requested split without binary float rounding errors."""
+    return int(n_rows * Decimal(str(train_split)))
+
+
 def load_yield_data_vae(
     file_path: Path,
     batch_size: int = 256,
@@ -111,7 +117,7 @@ def load_yield_data_vae(
     original = pd.read_csv(file_path)
 
     # Split into train and test sets
-    n_train = int(len(original) * train_split)
+    n_train = _training_count(len(original), train_split)
     subsets = (original[:n_train], original[n_train:])
 
     transform = [lambda df: pre_process_data(df, normalise=normalise)]
@@ -139,7 +145,7 @@ def load_yield_data_cvae(
     original = pd.read_csv(file_path)
 
     # Split into train and test sets
-    n_train = int(len(original) * train_split)
+    n_train = _training_count(len(original), train_split)
     subsets = (original[:n_train], original[n_train:])
 
     transform = [
@@ -722,7 +728,7 @@ def load_iv_data_hvae(
 
     # --- Temporal split -----------------------------------------------------
     common = surfaces["common_dates"]
-    n_train = int(len(common) * train_split)
+    n_train = _training_count(len(common), train_split)
     date_splits = {"train": common[:n_train], "test": common[n_train:]}
 
     # --- Categorical info (only for "full" mode) ----------------------------
