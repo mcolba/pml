@@ -13,6 +13,70 @@ DEFAULT_HIERARCHICAL_LATENT_COV = np.array(
     dtype=float,
 )
 
+HIERARCHICAL_PARENT_LOADING = np.array(
+    [
+        [0.32, 0.50],
+        [0.32, 0.46],
+        [0.32, 0.39],
+        [0.32, 0.24],
+        [0.32, 0.09],
+        [0.32, -0.20],
+        [0.32, -0.35],
+        [0.32, -0.57],
+        [0.32, -1.31],
+        [0.32, -1.67],
+    ],
+    dtype=float,
+)
+
+HIERARCHICAL_CHILD_LOADING = np.array(
+    [
+        [0.42, 0.58],
+        [0.42, 0.53],
+        [0.42, 0.45],
+        [0.42, 0.28],
+        [0.42, 0.11],
+        [0.42, -0.24],
+        [0.42, -0.40],
+        [0.42, -0.66],
+        [0.42, -1.50],
+        [0.42, -1.92],
+    ],
+    dtype=float,
+)
+
+
+def hierarchical_child_affine(
+    conditions: np.ndarray,
+    *,
+    rotation_scale: float = 0.6,
+    stretch_strength: float = 0.35,
+    condition_shift: float = 0.15,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return ``M(c)`` and ``b(c)`` for scalar hierarchical conditions."""
+    values = np.asarray(conditions, dtype=float)
+    angle = rotation_scale * values
+    tangent = np.tanh(values)
+    cos_angle = np.cos(angle)
+    sin_angle = np.sin(angle)
+    rotation = np.stack(
+        [
+            np.stack([cos_angle, -sin_angle], axis=-1),
+            np.stack([sin_angle, cos_angle], axis=-1),
+        ],
+        axis=-2,
+    )
+    stretch = np.stack(
+        [
+            1.0 + stretch_strength * tangent,
+            1.0 - stretch_strength * tangent,
+        ],
+        axis=-1,
+    )
+    stretch_matrix = stretch[..., :, None] * np.eye(2, dtype=float)
+    shift = condition_shift * np.stack([values, -values], axis=-1)
+    return rotation @ stretch_matrix, shift
+
 
 def _validate_covariance_matrix(
     matrix: np.ndarray,
@@ -197,37 +261,8 @@ def generate_conditional_hierarchical_sets(
     latent_cov = DEFAULT_HIERARCHICAL_LATENT_COV if cov is None else cov
     latent_cov = _validate_covariance_matrix(latent_cov, z_dim)
 
-    A = np.array(
-        [
-            [0.32, 0.50],
-            [0.32, 0.46],
-            [0.32, 0.39],
-            [0.32, 0.24],
-            [0.32, 0.09],
-            [0.32, -0.20],
-            [0.32, -0.35],
-            [0.32, -0.57],
-            [0.32, -1.31],
-            [0.32, -1.67],
-        ],
-        dtype=float,
-    )
-
-    B = np.array(
-        [
-            [0.42, 0.58],
-            [0.42, 0.53],
-            [0.42, 0.45],
-            [0.42, 0.28],
-            [0.42, 0.11],
-            [0.42, -0.24],
-            [0.42, -0.40],
-            [0.42, -0.66],
-            [0.42, -1.50],
-            [0.42, -1.92],
-        ],
-        dtype=float,
-    )
+    A = HIERARCHICAL_PARENT_LOADING
+    B = HIERARCHICAL_CHILD_LOADING
 
     z1 = _call_latent_sampler(
         latent_sampler=latent_sampler,
@@ -250,30 +285,14 @@ def generate_conditional_hierarchical_sets(
 
     condition_values = c2.squeeze(-1)
 
-    angle = rotation_scale * condition_values
-    t = np.tanh(condition_values)
-
-    cos_a = np.cos(angle)
-    sin_a = np.sin(angle)
-
-    s1 = 1.0 + stretch_strength * t
-    s2 = 1.0 - stretch_strength * t
-
-    R = np.stack(
-        [
-            np.stack([cos_a, -sin_a], axis=-1),
-            np.stack([sin_a, cos_a], axis=-1),
-        ],
-        axis=-2,
+    M, b = hierarchical_child_affine(
+        condition_values,
+        rotation_scale=rotation_scale,
+        stretch_strength=stretch_strength,
+        condition_shift=condition_shift,
     )
 
-    stretch_factors = np.stack([s1, s2], axis=-1)
-    S = stretch_factors[..., :, None] * np.eye(2, dtype=float)
-
-    M = R @ S
-
     z2_linear = (M @ z1[:, None, :, None]).squeeze(-1)
-    b = condition_shift * np.stack([condition_values, -condition_values], axis=-1)
     z2_mean = z2_linear + b
     z2 = z2_mean + sigma_z2 * rng.normal(size=z2_mean.shape)
 
@@ -281,8 +300,6 @@ def generate_conditional_hierarchical_sets(
     x2 = x2_mean + sigma_x2 * rng.normal(size=x2_mean.shape)
 
     return x1, x2, c2
-
-
 
 
 if __name__ == "__main__":

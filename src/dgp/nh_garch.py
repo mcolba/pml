@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import exp, log, pi, sqrt
-from typing import Optional, Tuple
 
 import numpy as np
 
@@ -55,7 +54,7 @@ def hn_monte_carlo_call_appendix_a(
     h1: float,  # initial conditional variance (daily)
     params: HNGarchParams,
     nsim: int = 10000,
-    seed: Optional[int] = 1234,
+    seed: int | None = 1234,
 ) -> float:
     """
     Appendix A style:
@@ -222,7 +221,7 @@ def hn_fourier_call_appendix_b(
 # -----------------------
 # test_hngarch_pricer.py
 # -----------------------
-def _default_params_from_appendix() -> Tuple[HNGarchParams, dict]:
+def _default_params_from_appendix() -> tuple[HNGarchParams, dict]:
     # Parameter block copied from both Appendix A and B snippets. :contentReference[oaicite:28]{index=28}
     params = HNGarchParams(
         a=1.32e-6,

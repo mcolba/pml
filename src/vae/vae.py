@@ -14,6 +14,7 @@ from pyro.optim import Adam
 from torch import nn
 
 from src.vae.training import EpochMetrics, TrainingConfig, TrainingStatus, train_svi
+from src.vae.utils.nn import build_mlp
 from src.vae.utils.vae_plots import plot_llk
 
 pyro.set_rng_seed(42)
@@ -23,18 +24,19 @@ torch.manual_seed(42)
 class Encoder(nn.Module):
     """Encode observations into diagonal-Gaussian latent parameters."""
 
-    def __init__(self, x_dim: int, z_dim: int, hidden_dim: int) -> None:
+    def __init__(
+        self, x_dim: int, z_dim: int, hidden_dim: Sequence[int] = (64, 64)
+    ) -> None:
         super().__init__()
         self.x_dim = x_dim
-        self.fc1 = nn.Linear(x_dim, hidden_dim)
-        self.fc21 = nn.Linear(hidden_dim, z_dim)
-        self.fc22 = nn.Linear(hidden_dim, z_dim)
-        self.softplus = nn.Softplus()
+        self.net = build_mlp(x_dim, hidden_dim)
+        self.fc21 = nn.Linear(hidden_dim[-1], z_dim)
+        self.fc22 = nn.Linear(hidden_dim[-1], z_dim)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Return the latent location and scale for a batch of observations."""
         x = x.reshape(-1, self.x_dim)
-        hidden = self.softplus(self.fc1(x))
+        hidden = self.net(x)
         z_loc = self.fc21(hidden)
         z_scale = F.softplus(self.fc22(hidden)) + 1e-4
         return z_loc, z_scale
@@ -43,29 +45,34 @@ class Encoder(nn.Module):
 class Decoder(nn.Module):
     """Decode latent draws into Gaussian observation parameters."""
 
-    def __init__(self, x_dim: int, z_dim: int, hidden_dim: int) -> None:
+    def __init__(
+        self, x_dim: int, z_dim: int, hidden_dim: Sequence[int] = (64, 64)
+    ) -> None:
         super().__init__()
         self.x_dim = x_dim
-        self.fc1 = nn.Linear(z_dim, hidden_dim)
-        self.fc21 = nn.Linear(hidden_dim, x_dim)
-        self.softplus = nn.Softplus()
-        self.log_x_scale = nn.Parameter(torch.zeros(x_dim))
+        self.net = build_mlp(z_dim, hidden_dim)
+        self.fc21 = nn.Linear(hidden_dim[-1], x_dim)
+        self.raw_x_scale = nn.Parameter(torch.zeros(x_dim))
 
     def forward(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return the decoded observation mean and log scale."""
-        hidden = self.softplus(self.fc1(z))
+        """Return the decoded observation mean and positive scale."""
+        hidden = self.net(z)
         x_loc = self.fc21(hidden)
-        return x_loc, self.log_x_scale.expand_as(x_loc)
+        x_scale = F.softplus(self.raw_x_scale) + 1e-4
+        return x_loc, x_scale.expand_as(x_loc)
 
 
 class VAE(nn.Module):
-    """Fit a Gaussian decoder with a Normal or multivariate Student-t prior."""
+    """Fit a Gaussian decoder with a Normal or multivariate Student-t prior.
+
+    ``hidden_dim`` lists encoder and decoder widths, defaulting to [64, 64].
+    """
 
     def __init__(
         self,
         x_dim: int,
         z_dim: int = 50,
-        hidden_dim: int = 400,
+        hidden_dim: Sequence[int] = (64, 64),
         use_cuda: bool = False,
         prior_t_df: float = np.inf,
     ) -> None:
@@ -128,8 +135,7 @@ class VAE(nn.Module):
             with pyro.poutine.scale(scale=annealing_factor):
                 z = pyro.sample("latent", self._latent_prior(z_loc, z_scale))
 
-            x_loc, log_x_scale = self.decoder(z)
-            x_scale = torch.exp(log_x_scale)
+            x_loc, x_scale = self.decoder(z)
 
             pyro.sample(
                 "obs",
@@ -163,8 +169,8 @@ class VAE(nn.Module):
             )
             z_scale = torch.ones_like(z_loc)
             z = self._latent_prior(z_loc, z_scale).sample()
-            x_loc, log_x_scale = self.decoder(z)
-            return dist.Normal(x_loc, torch.exp(log_x_scale)).sample()
+            x_loc, x_scale = self.decoder(z)
+            return dist.Normal(x_loc, x_scale).sample()
 
     def reconstruct(self, x: torch.Tensor) -> torch.Tensor:
         """Return a stochastic reconstruction for a batch of observations."""
@@ -183,7 +189,7 @@ class VAE(nn.Module):
 def train(
     data_loaders: Iterable,
     x_dim: int,
-    hidden_dim: int = 50,
+    hidden_dim: Sequence[int] = (64, 64),
     z_dim: int = 2,
     beta: float | torch.Tensor = 1.0,
     annealing_start: float | torch.Tensor = 1.0,

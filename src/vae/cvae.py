@@ -15,6 +15,7 @@ from torch import nn
 
 from src.dHSIC import make_elbo_hsic
 from src.vae.training import EpochMetrics, TrainingConfig, TrainingStatus, train_svi
+from src.vae.utils.nn import build_mlp
 from src.vae.utils.vae_plots import plot_llk
 
 pyro.set_rng_seed(42)
@@ -24,14 +25,15 @@ torch.manual_seed(42)
 class Encoder(nn.Module):
     """Encode observations and conditioning into latent parameters."""
 
-    def __init__(self, x_dim, c_dim, z_dim, hidden_dim) -> None:
+    def __init__(
+        self, x_dim: int, c_dim: int, z_dim: int, hidden_dim: Sequence[int] = (64, 64)
+    ) -> None:
         super().__init__()
         self.x_dim = x_dim
         self.c_dim = c_dim
-        self.fc1 = nn.Linear(x_dim + c_dim, hidden_dim)
-        self.fc21 = nn.Linear(hidden_dim, z_dim)
-        self.fc22 = nn.Linear(hidden_dim, z_dim)
-        self.softplus = nn.Softplus()
+        self.net = build_mlp(x_dim + c_dim, hidden_dim)
+        self.fc21 = nn.Linear(hidden_dim[-1], z_dim)
+        self.fc22 = nn.Linear(hidden_dim[-1], z_dim)
 
     def forward(
         self, x: torch.Tensor, c: torch.Tensor
@@ -41,9 +43,8 @@ class Encoder(nn.Module):
         c = c.reshape(-1, self.c_dim)
         xc = torch.cat([x, c], dim=-1)
 
-        hidden = self.softplus(self.fc1(xc))
+        hidden = self.net(xc)
         z_loc = self.fc21(hidden)
-        # z_scale = torch.exp(self.fc22(hidden))
         z_scale = F.softplus(self.fc22(hidden)) + 1e-4
         return z_loc, z_scale
 
@@ -51,13 +52,14 @@ class Encoder(nn.Module):
 class EncoderNoCond(nn.Module):
     """Encode observations into latent parameters without conditioning."""
 
-    def __init__(self, x_dim, z_dim, hidden_dim) -> None:
+    def __init__(
+        self, x_dim: int, z_dim: int, hidden_dim: Sequence[int] = (64, 64)
+    ) -> None:
         super().__init__()
         self.x_dim = x_dim
-        self.fc1 = nn.Linear(x_dim, hidden_dim)
-        self.fc21 = nn.Linear(hidden_dim, z_dim)
-        self.fc22 = nn.Linear(hidden_dim, z_dim)
-        self.softplus = nn.Softplus()
+        self.net = build_mlp(x_dim, hidden_dim)
+        self.fc21 = nn.Linear(hidden_dim[-1], z_dim)
+        self.fc22 = nn.Linear(hidden_dim[-1], z_dim)
 
     def forward(
         self, x: torch.Tensor, _: torch.Tensor | None
@@ -65,7 +67,7 @@ class EncoderNoCond(nn.Module):
         """Return the latent location and scale for an unconditioned batch."""
         x = x.reshape(-1, self.x_dim)
 
-        hidden = self.softplus(self.fc1(x))
+        hidden = self.net(x)
         z_loc = self.fc21(hidden)
         z_scale = F.softplus(self.fc22(hidden)) + 1e-4
         return z_loc, z_scale
@@ -74,61 +76,66 @@ class EncoderNoCond(nn.Module):
 class Decoder(nn.Module):
     """Decode latent draws and conditioning into Gaussian parameters."""
 
-    def __init__(self, x_dim, z_dim, c_dim, hidden_dim) -> None:
+    def __init__(
+        self, x_dim: int, z_dim: int, c_dim: int, hidden_dim: Sequence[int] = (64, 64)
+    ) -> None:
         super().__init__()
-        self.fc1 = nn.Linear(z_dim + c_dim, hidden_dim)
-        self.fc21 = nn.Linear(hidden_dim, x_dim)
-        self.softplus = nn.Softplus()
-        self.log_x_scale = nn.Parameter(torch.zeros(x_dim))
+        self.net = build_mlp(z_dim + c_dim, hidden_dim)
+        self.fc21 = nn.Linear(hidden_dim[-1], x_dim)
+        self.raw_x_scale = nn.Parameter(torch.zeros(x_dim))
 
     def forward(
         self, z: torch.Tensor, c: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return the decoded observation mean and log scale."""
+        """Return the decoded observation mean and positive scale."""
         zc = torch.cat([z, c], dim=-1)
-        hidden = self.softplus(self.fc1(zc))
+        hidden = self.net(zc)
         x_loc = self.fc21(hidden)
-        return x_loc, self.log_x_scale.expand_as(x_loc)
+        x_scale = F.softplus(self.raw_x_scale) + 1e-4
+        return x_loc, x_scale.expand_as(x_loc)
 
 
 class DecoderVolScaling(nn.Module):
     """Decode latent draws with FiLM-style conditioning on the hidden state."""
 
-    def __init__(self, x_dim, z_dim, c_dim, hidden_dim) -> None:
+    def __init__(
+        self, x_dim: int, z_dim: int, c_dim: int, hidden_dim: Sequence[int] = (64, 64)
+    ) -> None:
         super().__init__()
-        self.fc1 = nn.Linear(z_dim + c_dim, hidden_dim)
-        self.softplus = nn.Softplus()
-        self.film_scale = nn.Linear(c_dim, hidden_dim)
-        self.film_shift = nn.Linear(c_dim, hidden_dim)
-        self.fc21 = nn.Linear(hidden_dim, x_dim)
-        self.fc22 = nn.Linear(hidden_dim, x_dim)
+        net = build_mlp(z_dim + c_dim, hidden_dim)
+        self.fc1 = net[0]
+        self.elu = net[1]
+        self.hidden_layers = net[2:]
+        self.film_scale = nn.Linear(c_dim, hidden_dim[0])
+        self.film_shift = nn.Linear(c_dim, hidden_dim[0])
+        self.fc21 = nn.Linear(hidden_dim[-1], x_dim)
+        self.fc22 = nn.Linear(hidden_dim[-1], x_dim)
 
     def forward(
         self, z: torch.Tensor, c: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return the decoded observation mean and log scale."""
+        """Return the decoded observation mean and positive scale."""
         zc = torch.cat([z, c], dim=-1)
         hidden = self.fc1(zc)
         scale = self.film_scale(c)
         shift = self.film_shift(c)
-        hidden = self.softplus(hidden * scale + shift)
+        hidden = self.hidden_layers(self.elu(hidden * scale + shift))
         x_loc = self.fc21(hidden)
-        x_log_scale = self.fc22(hidden)
-        return x_loc, x_log_scale
+        x_scale = F.softplus(self.fc22(hidden)) + 1e-4
+        return x_loc, x_scale
 
 
 class PriorNetwork(nn.Module):
     """Map conditioning features to a diagonal-Gaussian latent prior."""
 
-    def __init__(self, c_dim, z_dim, hidden_dim=50) -> None:
+    def __init__(
+        self, c_dim: int, z_dim: int, hidden_dim: Sequence[int] = (64, 64)
+    ) -> None:
         super().__init__()
         self.c_dim = c_dim
-        self.net = nn.Sequential(
-            nn.Linear(c_dim, hidden_dim),
-            nn.Softplus(),
-        )
-        self.fc_loc = nn.Linear(hidden_dim, z_dim)
-        self.fc_scale = nn.Linear(hidden_dim, z_dim)
+        self.net = build_mlp(c_dim, hidden_dim)
+        self.fc_loc = nn.Linear(hidden_dim[-1], z_dim)
+        self.fc_scale = nn.Linear(hidden_dim[-1], z_dim)
 
     def forward(self, c: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Return the prior location and scale for a conditioned batch."""
@@ -142,23 +149,34 @@ class PriorNetwork(nn.Module):
 class LatentScale(nn.Module):
     """Map conditioning features to a positive latent scale."""
 
-    def __init__(self, c_dim, z_dim, hidden_dim=50) -> None:
+    def __init__(
+        self, c_dim: int, z_dim: int, hidden_dim: Sequence[int] = (64, 64)
+    ) -> None:
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(c_dim, hidden_dim),
-            nn.Softplus(),
-            nn.Linear(hidden_dim, z_dim),
+            build_mlp(c_dim, hidden_dim),
+            nn.Linear(hidden_dim[-1], z_dim),
         )
 
     def forward(self, c: torch.Tensor) -> torch.Tensor:
         """Return a positive latent scale for a conditioned batch."""
-        return (torch.sigmoid(self.net(c)) * 20) + 1e-4
+        return F.softplus(self.net(c)) + 1e-4
 
 
 class CVAE(nn.Module):
-    """Fit a conditional VAE with a learned latent prior network."""
+    """Fit a conditional VAE with a learned latent prior network.
 
-    def __init__(self, x_dim, c_dim, z_dim=50, hidden_dim=400, use_cuda=False) -> None:
+    ``hidden_dim`` lists encoder and decoder widths, defaulting to ``[64, 64]``.
+    """
+
+    def __init__(
+        self,
+        x_dim: int,
+        c_dim: int,
+        z_dim: int = 50,
+        hidden_dim: Sequence[int] = (64, 64),
+        use_cuda: bool = False,
+    ) -> None:
         super().__init__()
         self.x_dim = x_dim
         self.c_dim = c_dim
@@ -204,8 +222,7 @@ class CVAE(nn.Module):
             with pyro.poutine.scale(scale=annealing_factor):
                 z = pyro.sample("latent", dist.Normal(z_loc, z_scale).to_event(1))
 
-            x_loc, log_x_scale = self.decoder(z, c)
-            x_scale = torch.exp(log_x_scale).expand_as(x_loc)
+            x_loc, x_scale = self.decoder(z, c)
 
             pyro.sample(
                 "obs",
@@ -247,9 +264,19 @@ class CVAE(nn.Module):
 
 
 class CVAEVolClustering(nn.Module):
-    """Fit a conditional VAE with FiLM-style decoder scaling."""
+    """Fit a conditional VAE with FiLM-style decoder scaling.
 
-    def __init__(self, x_dim, c_dim, z_dim=50, hidden_dim=400, use_cuda=False) -> None:
+    ``hidden_dim`` lists encoder and decoder widths, defaulting to ``[64, 64]``.
+    """
+
+    def __init__(
+        self,
+        x_dim: int,
+        c_dim: int,
+        z_dim: int = 50,
+        hidden_dim: Sequence[int] = (64, 64),
+        use_cuda: bool = False,
+    ) -> None:
         super().__init__()
         self.x_dim = x_dim
         self.c_dim = c_dim
@@ -295,8 +322,7 @@ class CVAEVolClustering(nn.Module):
             with pyro.poutine.scale(scale=annealing_factor):
                 z = pyro.sample("latent", dist.Normal(z_loc, z_scale).to_event(1))
 
-            x_loc, log_x_scale = self.decoder(z, c)
-            x_scale = torch.exp(log_x_scale)
+            x_loc, x_scale = self.decoder(z, c)
 
             pyro.sample(
                 "obs",
@@ -338,9 +364,19 @@ class CVAEVolClustering(nn.Module):
 
 
 class CVAEEteroschPrior(nn.Module):
-    """Fit a conditional VAE with a heteroscedastic latent prior scale."""
+    """Fit a conditional VAE with a heteroscedastic latent prior scale.
 
-    def __init__(self, x_dim, c_dim, z_dim=50, hidden_dim=400, use_cuda=False) -> None:
+    ``hidden_dim`` lists encoder and decoder widths, defaulting to ``[64, 64]``.
+    """
+
+    def __init__(
+        self,
+        x_dim: int,
+        c_dim: int,
+        z_dim: int = 50,
+        hidden_dim: Sequence[int] = (64, 64),
+        use_cuda: bool = False,
+    ) -> None:
         super().__init__()
         self.x_dim = x_dim
         self.c_dim = c_dim
@@ -388,8 +424,7 @@ class CVAEEteroschPrior(nn.Module):
             with pyro.poutine.scale(scale=annealing_factor):
                 z = pyro.sample("latent", dist.Normal(z_loc, z_scale).to_event(1))
 
-            x_loc, log_x_scale = self.decoder(z, c)
-            x_scale = torch.exp(log_x_scale)
+            x_loc, x_scale = self.decoder(z, c)
 
             pyro.sample(
                 "obs",
@@ -434,7 +469,7 @@ def train(
     data_loaders: Iterable,
     x_dim: int,
     c_dim: int,
-    hidden_dim: int = 50,
+    hidden_dim: Sequence[int] = (64, 64),
     z_dim=2,
     beta=1,
     annealing_start=1,

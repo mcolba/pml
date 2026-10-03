@@ -32,43 +32,23 @@ from collections.abc import Iterable, Sequence
 import pyro
 import pyro.distributions as dist
 import torch
-import torch.nn.functional as F
 from pyro.infer import SVI, Trace_ELBO
 from pyro.optim import Adam
 from torch import nn
 
-from src.vae.nn_blocks import (
+from src.vae.training import EpochMetrics, TrainingConfig, TrainingStatus, train_svi
+from src.vae.utils.nn import (
+    ChildDecoder,
     ChildEncoder,
     ChildPrior,
     ParentDecoder,
     ParentEncoder,
     ParentEncoderInput,
 )
-from src.vae.training import EpochMetrics, TrainingConfig, TrainingStatus, train_svi
 from src.vae.utils.vae_plots import plot_llk
 
 pyro.set_rng_seed(42)
 torch.manual_seed(42)
-
-
-class ChildDecoder(nn.Module):
-    """p(x2 | z2, z1, c2) — shared child decoder across all names."""
-
-    def __init__(
-        self, x2_dim: int, z2_dim: int, z1_dim: int, c2_dim: int, hidden_dim: int
-    ):
-        super().__init__()
-        self.fc1 = nn.Linear(z2_dim + z1_dim + c2_dim, hidden_dim)
-        self.fc_loc = nn.Linear(hidden_dim, x2_dim)
-        self.log_x_scale = nn.Parameter(torch.zeros(x2_dim))
-
-    def forward(
-        self, z2: torch.Tensor, z1: torch.Tensor, c2: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        inp = torch.cat([z2, z1, c2], dim=-1)
-        hidden = F.softplus(self.fc1(inp))
-        x_loc = self.fc_loc(hidden)
-        return x_loc, self.log_x_scale.expand_as(x_loc)
 
 
 class HierarchicalVAE(nn.Module):
@@ -93,11 +73,11 @@ class HierarchicalVAE(nn.Module):
         c2_dim: int,
         z1_dim: int = 3,
         z2_dim: int = 3,
-        hidden_dim: int = 64,
+        hidden_dim: Sequence[int] = (64, 64),
         set_encoder: nn.Module | None = None,
         z1_input: ParentEncoderInput | None = None,
         use_cuda: bool = False,
-    ):
+    ) -> None:
         """
         Parameters
         ----------
@@ -111,8 +91,8 @@ class HierarchicalVAE(nn.Module):
             Dimensionality of global latent z1.
         z2_dim : int
             Dimensionality of child latent z2.
-        hidden_dim : int
-            Hidden dimension for encoder/decoder networks.
+        hidden_dim : sequence of int
+            Hidden layer widths for encoder/decoder networks, default (64, 64).
         set_encoder : nn.Module, optional
             Set encoder for aggregating child pairs ``(x2, c2)`` into a
             summary. If provided, the global encoder receives
@@ -227,8 +207,7 @@ class HierarchicalVAE(nn.Module):
 
             # ── reconstruct x1 (date-level observation) ──
             z1_2d = z1.squeeze(-2)  # (B, z1_dim)
-            x1_loc, log_x1_scale = self.index_decoder(z1_2d)  # each (B, x1_dim)
-            x1_scale = torch.exp(log_x1_scale)
+            x1_loc, x1_scale = self.index_decoder(z1_2d)  # each (B, x1_dim)
             pyro.sample(
                 "obs_x1",
                 dist.Normal(
@@ -259,13 +238,11 @@ class HierarchicalVAE(nn.Module):
                     # z2: (B, N_max, z2_dim)
 
                     z2_flat = z2.reshape(B * N_max, self.z2_dim)
-                    x2_loc_flat, log_x2_scale_flat = self.child_decoder(
+                    x2_loc_flat, x2_scale_flat = self.child_decoder(
                         z2_flat, z1_flat, c2_flat
                     )
                     x2_loc = x2_loc_flat.reshape(B, N_max, self.x2_dim)
-                    x2_scale = torch.exp(log_x2_scale_flat).reshape(
-                        B, N_max, self.x2_dim
-                    )
+                    x2_scale = x2_scale_flat.reshape(B, N_max, self.x2_dim)
                     pyro.sample(
                         "obs_x2",
                         dist.Normal(x2_loc, x2_scale, validate_args=False).to_event(1),
@@ -455,7 +432,7 @@ def train(
     c2_dim: int,
     z1_dim: int = 4,
     z2_dim: int = 2,
-    hidden_dim: int = 64,
+    hidden_dim: Sequence[int] = (64, 64),
     set_encoder: nn.Module | None = None,
     beta: float = 1.0,
     annealing_start: float = 1.0,

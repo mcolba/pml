@@ -1,5 +1,6 @@
 """Shared building blocks for hierarchical VAE variants."""
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
@@ -9,18 +10,31 @@ from torch import nn
 from src.vae.utils.set_transformer import MeanPoolSetEncoder
 
 
+def build_mlp(input_dim: int, hidden_dim: Sequence[int]) -> nn.Sequential:
+    """Build an ELU MLP with one linear layer per positive hidden width."""
+    if len(hidden_dim) == 0 or any(width <= 0 for width in hidden_dim):
+        raise ValueError("hidden_dim must contain positive layer widths")
+    layers: list[nn.Module] = []
+    for width in hidden_dim:
+        layers.extend([nn.Linear(input_dim, width), nn.ELU()])
+        input_dim = width
+    return nn.Sequential(*layers)
+
+
 class ParentEncoder(nn.Module):
     """q(z1 | x1) — infer global latent from Index only."""
 
-    def __init__(self, x1_dim: int, z1_dim: int, hidden_dim: int):
+    def __init__(
+        self, x1_dim: int, z1_dim: int, hidden_dim: Sequence[int] = (64, 64)
+    ) -> None:
         super().__init__()
-        self.fc1 = nn.Linear(x1_dim, hidden_dim)
-        self.fc_loc = nn.Linear(hidden_dim, z1_dim)
-        self.fc_scale = nn.Linear(hidden_dim, z1_dim)
+        self.net = build_mlp(x1_dim, hidden_dim)
+        self.fc_loc = nn.Linear(hidden_dim[-1], z1_dim)
+        self.fc_scale = nn.Linear(hidden_dim[-1], z1_dim)
 
     def forward(self, x1: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        x1 = x1.reshape(-1, self.fc1.in_features)
-        hidden = F.softplus(self.fc1(x1))
+        x1 = x1.reshape(-1, self.net[0].in_features)
+        hidden = self.net(x1)
         z1_loc = self.fc_loc(hidden)
         z1_scale = F.softplus(self.fc_scale(hidden)) + 1e-4
         return z1_loc, z1_scale
@@ -29,32 +43,41 @@ class ParentEncoder(nn.Module):
 class ParentDecoder(nn.Module):
     """p(x1 | z1) — reconstruct Index from global latent."""
 
-    def __init__(self, x1_dim: int, z1_dim: int, hidden_dim: int):
+    def __init__(
+        self, x1_dim: int, z1_dim: int, hidden_dim: Sequence[int] = (64, 64)
+    ) -> None:
         super().__init__()
-        self.fc1 = nn.Linear(z1_dim, hidden_dim)
-        self.fc_loc = nn.Linear(hidden_dim, x1_dim)
-        self.log_x_scale = nn.Parameter(torch.zeros(x1_dim))
+        self.net = build_mlp(z1_dim, hidden_dim)
+        self.fc_loc = nn.Linear(hidden_dim[-1], x1_dim)
+        self.raw_x_scale = nn.Parameter(torch.zeros(x1_dim))
 
     def forward(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        hidden = F.softplus(self.fc1(z))
+        hidden = self.net(z)
         x_loc = self.fc_loc(hidden)
-        return x_loc, self.log_x_scale.expand_as(x_loc)
+        x_scale = F.softplus(self.raw_x_scale) + 1e-4
+        return x_loc, x_scale.expand_as(x_loc)
 
 
 class ChildPrior(nn.Module):
     """p(z2 | z1, c2) — learned conditional prior for child latent."""
 
-    def __init__(self, z1_dim: int, c2_dim: int, z2_dim: int, hidden_dim: int):
+    def __init__(
+        self,
+        z1_dim: int,
+        c2_dim: int,
+        z2_dim: int,
+        hidden_dim: Sequence[int] = (64, 64),
+    ) -> None:
         super().__init__()
-        self.fc1 = nn.Linear(z1_dim + c2_dim, hidden_dim)
-        self.fc_loc = nn.Linear(hidden_dim, z2_dim)
-        self.fc_scale = nn.Linear(hidden_dim, z2_dim)
+        self.net = build_mlp(z1_dim + c2_dim, hidden_dim)
+        self.fc_loc = nn.Linear(hidden_dim[-1], z2_dim)
+        self.fc_scale = nn.Linear(hidden_dim[-1], z2_dim)
 
     def forward(
         self, z1: torch.Tensor, c2: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         inp = torch.cat([z1, c2], dim=-1)
-        hidden = F.softplus(self.fc1(inp))
+        hidden = self.net(inp)
         z2_loc = self.fc_loc(hidden)
         z2_scale = F.softplus(self.fc_scale(hidden)) + 1e-4
         return z2_loc, z2_scale
@@ -64,21 +87,52 @@ class ChildEncoder(nn.Module):
     """q(z2 | x2, z1, c2) — shared child encoder across all names."""
 
     def __init__(
-        self, x2_dim: int, z1_dim: int, c2_dim: int, z2_dim: int, hidden_dim: int
-    ):
+        self,
+        x2_dim: int,
+        z1_dim: int,
+        c2_dim: int,
+        z2_dim: int,
+        hidden_dim: Sequence[int] = (64, 64),
+    ) -> None:
         super().__init__()
-        self.fc1 = nn.Linear(x2_dim + z1_dim + c2_dim, hidden_dim)
-        self.fc_loc = nn.Linear(hidden_dim, z2_dim)
-        self.fc_scale = nn.Linear(hidden_dim, z2_dim)
+        self.net = build_mlp(x2_dim + z1_dim + c2_dim, hidden_dim)
+        self.fc_loc = nn.Linear(hidden_dim[-1], z2_dim)
+        self.fc_scale = nn.Linear(hidden_dim[-1], z2_dim)
 
     def forward(
         self, x2: torch.Tensor, z1: torch.Tensor, c2: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         inp = torch.cat([x2, z1, c2], dim=-1)
-        hidden = F.softplus(self.fc1(inp))
+        hidden = self.net(inp)
         z2_loc = self.fc_loc(hidden)
         z2_scale = F.softplus(self.fc_scale(hidden)) + 1e-4
         return z2_loc, z2_scale
+
+
+class ChildDecoder(nn.Module):
+    """p(x2 | z2, z1, c2) — shared child decoder across all names."""
+
+    def __init__(
+        self,
+        x2_dim: int,
+        z2_dim: int,
+        z1_dim: int,
+        c2_dim: int,
+        hidden_dim: Sequence[int] = (64, 64),
+    ) -> None:
+        super().__init__()
+        self.net = build_mlp(z2_dim + z1_dim + c2_dim, hidden_dim)
+        self.fc_loc = nn.Linear(hidden_dim[-1], x2_dim)
+        self.raw_x_scale = nn.Parameter(torch.zeros(x2_dim))
+
+    def forward(
+        self, z2: torch.Tensor, z1: torch.Tensor, c2: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        inp = torch.cat([z2, z1, c2], dim=-1)
+        hidden = self.net(inp)
+        x_loc = self.fc_loc(hidden)
+        x_scale = F.softplus(self.raw_x_scale) + 1e-4
+        return x_loc, x_scale.expand_as(x_loc)
 
 
 @dataclass(frozen=True)
